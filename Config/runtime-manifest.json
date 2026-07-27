@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "acpProtocolVersion": 1,
+  "buildToolchain": {
+    "bun": "1.3.13"
+  },
+  "codexACP": {
+    "version": "1.1.7",
+    "repository": "https://github.com/agentclientprotocol/codex-acp.git",
+    "commit": "ba5bef59cfcea4229841fe9438d816696621307b"
+  },
+  "codex": {
+    "version": "0.145.0",
+    "source": "@openai/codex",
+    "repository": "https://github.com/openai/codex.git",
+    "tag": "rust-v0.145.0",
+    "commit": "25af12f7e61572b0bc18ddb1008be543b91519b0"
+  },
+  "longview": {
+    "repository": "https://github.com/kohoj/longview.git",
+    "commit": "1400db26424323e5e413bdf2f1b03a07961f2458"
+  }
+}

@@ -1,0 +1,70 @@
+name: Development release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*-alpha.*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  universal-app:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.13
+      - name: Verify source
+        run: scripts/verify-mien.sh
+      - name: Assemble universal development app
+        run: scripts/assemble-app.sh
+      - name: Archive development bundle
+        run: |
+          ditto -c -k --keepParent \
+            .build/distribution/Mien.app \
+            .build/distribution/Mien-development-unnotarized-macos.zip
+          (
+            cd .build/distribution
+            shasum -a 256 Mien-development-unnotarized-macos.zip \
+              > Mien-development-unnotarized-macos.zip.sha256
+          )
+          cp .build/runtime-helpers/universal/provenance.json \
+            .build/distribution/runtime-provenance.json
+          cp .build/distribution/Mien.app/Contents/Resources/mien.cdx.json \
+            .build/distribution/mien.cdx.json
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Mien-development-unnotarized-macos
+          path: |
+            .build/distribution/Mien-development-unnotarized-macos.zip
+            .build/distribution/Mien-development-unnotarized-macos.zip.sha256
+            .build/distribution/runtime-provenance.json
+            .build/distribution/mien.cdx.json
+      - name: Publish tagged prerelease
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assets=(
+            .build/distribution/Mien-development-unnotarized-macos.zip
+            .build/distribution/Mien-development-unnotarized-macos.zip.sha256
+            .build/distribution/runtime-provenance.json
+            .build/distribution/mien.cdx.json
+          )
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --prerelease \
+              --generate-notes \
+              --title "Mien $GITHUB_REF_NAME — developer preview" \
+              --notes "Universal macOS developer preview. This artifact is ad-hoc signed and not notarized; source builds are the recommended evaluation path."
+          fi

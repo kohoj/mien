@@ -1,0 +1,22 @@
+.build/
+.DS_Store
+*.xcuserstate
+
+# Historical local research retained outside the public product surface.
+/Legacy/
+/Sources/AmbientContext*/
+/Sources/Longview*/
+/Tests/AmbientContextCoreTests/
+/Tests/Longview*/
+/Fixtures/
+/Resources/Experiments/
+/docs/agent-contract.md
+/docs/architecture.md
+/evidence/
+/research/
+/scripts/build-cli.sh
+/scripts/stitch-wechat-long-screenshot.py
+/scripts/verify-cli.sh
+/*.png
+/Resources/AppIcon/mien-chroma.png
+/Resources/AppIcon/mien-1254-*.png
