@@ -36,6 +36,7 @@ final class LongviewAdapterTests: XCTestCase {
         target: target,
         outputURL: outputURL,
         maximumFrames: 8,
+        direction: .up,
         focusPolicy: .backgroundOnly
       ), now: now)
 
@@ -52,6 +53,7 @@ final class LongviewAdapterTests: XCTestCase {
         "--window-id", String(target.window.windowID),
         "--bundle-id", target.window.bundleIdentifier,
         "--max-frames", "8",
+        "--direction", "up",
         "--focus-policy", "background-only",
       ])
   }
@@ -95,6 +97,45 @@ final class LongviewAdapterTests: XCTestCase {
     }
   }
 
+  func testContinuityLossReturnsExplicitlyIncompleteEvidence() async throws {
+    let now = Date()
+    let target = makeTarget(now: now)
+    let outputURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("\(UUID().uuidString).png")
+    try Data("png".utf8).write(to: outputURL)
+    defer { try? FileManager.default.removeItem(at: outputURL) }
+
+    let runner = StubProcessRunner(
+      output: ProcessOutput(
+        status: 0,
+        standardOutput: Data(
+          (successEnvelope(
+            target: target,
+            outputURL: outputURL,
+            restorationSucceeded: true,
+            stopReason: .continuityLost
+          ) + "\n").utf8),
+        standardError: Data()
+      ))
+    let adapter = try LongviewAdapter(
+      executableURL: URL(fileURLWithPath: "/usr/local/bin/longview"),
+      runner: runner
+    )
+
+    let outcome = try await adapter.capture(
+      LongviewCaptureRequest(
+        taskID: UUID(),
+        target: target,
+        outputURL: outputURL,
+        maximumFrames: 24,
+        direction: .up,
+        focusPolicy: .backgroundFirst
+      ), now: now)
+
+    XCTAssertEqual(outcome.stopReason, .continuityLost)
+    XCTAssertFalse(outcome.artifact.complete)
+  }
+
   private func makeTarget(now: Date) -> TargetLease {
     TargetLease(
       invocationSnapshotID: UUID(),
@@ -116,10 +157,11 @@ final class LongviewAdapterTests: XCTestCase {
   private func successEnvelope(
     target: TargetLease,
     outputURL: URL,
-    restorationSucceeded: Bool
+    restorationSucceeded: Bool,
+    stopReason: LongviewStopReason = .frameLimitReached
   ) -> String {
     """
-    {"schemaVersion":2,"type":"result","ok":true,"command":"longshot","result":{"target":{"processIdentifier":\(target.window.processIdentifier),"windowNumber":\(target.window.windowID)},"outputPath":"\(outputURL.path)","pixelWidth":747,"pixelHeight":3104,"capturedFrameCount":8,"detectedOverlaps":[120,118,121,119,120,118,120],"scrollRoute":"accessibility-value","stopReason":"frame-limit-reached","targetWasActivated":false,"pointerWasMoved":false,"viewportRestorationAttempted":true,"viewportRestorationSucceeded":\(restorationSucceeded),"environmentRestorationSucceeded":\(restorationSucceeded),"focusRestorationSucceeded":true,"pointerRestorationSucceeded":true,"effectivePixelsPerSecond":1000}}
+    {"schemaVersion":2,"type":"result","ok":true,"command":"longshot","result":{"target":{"processIdentifier":\(target.window.processIdentifier),"windowNumber":\(target.window.windowID)},"outputPath":"\(outputURL.path)","pixelWidth":747,"pixelHeight":3104,"capturedFrameCount":8,"detectedOverlaps":[120,118,121,119,120,118,120],"scrollRoute":"accessibility-value","stopReason":"\(stopReason.rawValue)","targetWasActivated":false,"pointerWasMoved":false,"viewportRestorationAttempted":true,"viewportRestorationSucceeded":\(restorationSucceeded),"environmentRestorationSucceeded":\(restorationSucceeded),"focusRestorationSucceeded":true,"pointerRestorationSucceeded":true,"effectivePixelsPerSecond":1000}}
     """
   }
 }

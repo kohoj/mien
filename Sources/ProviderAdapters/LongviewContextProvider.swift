@@ -54,7 +54,18 @@ public struct LongviewContextProvider: ContextProvider {
         target: request.target,
         outputURL: outputURL,
         maximumFrames: maximumFrames,
-        focusPolicy: .backgroundOnly
+        // Visual history means content preceding the current viewport. Chat
+        // windows normally open at the newest message, so scrolling down ends
+        // immediately and Longview cannot establish an overlap. The direction
+        // is part of the typed evidence contract, not an inference from prose.
+        direction: maximumFrames > 1 ? .up : .down,
+        // Several applications — WeChat among them — expose no background
+        // scroll route at all, so `background-only` fails outright with
+        // `background_scroll_unavailable`. `background-first` still prefers the
+        // background route and only activates the window when that route is
+        // unavailable; the adapter then refuses the capture unless Longview
+        // verifies that focus, viewport, and pointer were all restored.
+        focusPolicy: .backgroundFirst
       ))
     let data = try Data(contentsOf: outputURL, options: [.mappedIfSafe])
     guard data.count <= request.budget.maximumBytes else {

@@ -4,6 +4,30 @@ import TaskRuntime
 import XCTest
 
 final class TaskLedgerTests: XCTestCase {
+  func testTypedNoContextRouteRemainsMonotonic() async throws {
+    let now = Date()
+    let ledger = try TaskLedger(capsule: makeCapsule(now: now), now: now)
+
+    try await ledger.transition(to: .targetLocked, actor: .host, reason: "lease verified")
+    try await ledger.transition(
+      to: .contextPlanning,
+      actor: .agent,
+      reason: "selecting evidence"
+    )
+    try await ledger.transition(
+      to: .agentRunning,
+      actor: .agent,
+      reason: "typed no-context decision"
+    )
+    try await ledger.transition(to: .succeeded, actor: .verifier, reason: "outcome verified")
+
+    let states = await ledger.events().map(\.state)
+    XCTAssertEqual(
+      states,
+      [.created, .targetLocked, .contextPlanning, .agentRunning, .succeeded]
+    )
+  }
+
   func testLedgerIsMonotonicAndRejectsSkippedOwnershipStages() async throws {
     let now = Date()
     let ledger = try TaskLedger(capsule: makeCapsule(now: now), now: now)
@@ -22,6 +46,11 @@ final class TaskLedgerTests: XCTestCase {
     }
 
     try await ledger.transition(to: .targetLocked, actor: .host, reason: "lease verified")
+    try await ledger.transition(
+      to: .contextPlanning,
+      actor: .agent,
+      reason: "evidence requested"
+    )
     try await ledger.transition(to: .contextReady, actor: .host, reason: "manifest ready")
     try await ledger.transition(to: .agentRunning, actor: .agent, reason: "prompt accepted")
     try await ledger.transition(to: .succeeded, actor: .verifier, reason: "read-only result ready")
@@ -30,7 +59,7 @@ final class TaskLedgerTests: XCTestCase {
     let events = await ledger.events()
     let finalState = await ledger.currentState
     let terminalOutcome = await ledger.terminalOutcome
-    XCTAssertEqual(events.map(\.sequence), [0, 1, 2, 3, 4, 5])
+    XCTAssertEqual(events.map(\.sequence), [0, 1, 2, 3, 4, 5, 6])
     XCTAssertEqual(finalState, .cleanupVerified)
     XCTAssertEqual(terminalOutcome, .succeeded)
   }
@@ -40,6 +69,11 @@ final class TaskLedgerTests: XCTestCase {
     let ledger = try TaskLedger(capsule: makeCapsule(now: now), now: now)
 
     try await ledger.transition(to: .targetLocked, actor: .host, reason: "lease verified")
+    try await ledger.transition(
+      to: .contextPlanning,
+      actor: .agent,
+      reason: "evidence requested"
+    )
     try await ledger.transition(to: .contextReady, actor: .host, reason: "manifest ready")
     try await ledger.transition(to: .agentRunning, actor: .agent, reason: "prompt accepted")
     try await ledger.transition(to: .executing, actor: .executor, reason: "draft transaction")

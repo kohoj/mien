@@ -83,7 +83,12 @@ public struct AccessibilityContextProvider: ContextProvider {
   public func probe(target: TargetLease) async -> ProviderCapability {
     let trusted = AXIsProcessTrusted()
     let semanticTarget = target.semanticTarget
-    let conversationCapable = semanticTarget?.ancestorRoles.contains("AXScrollArea") == true
+    let conversationRoles: Set<String> = ["AXScrollArea", "AXList", "AXTable"]
+    let conversationCapable =
+      semanticTarget.map {
+        conversationRoles.contains($0.role)
+          || $0.ancestorRoles.contains(where: conversationRoles.contains)
+      } == true
     return ProviderCapability(
       available: trusted && semanticTarget?.frame != nil
         && semanticTarget?.protectedContent != true,
@@ -160,30 +165,35 @@ public struct AccessibilityContextProvider: ContextProvider {
 
     let application = AXUIElementCreateApplication(target.window.processIdentifier)
     AXUIElementSetMessagingTimeout(application, 0.18)
-    var hit: AXUIElement?
+    var probe: AXUIElement?
     let centerX = Float(frame.origin.x + frame.size.width / 2)
     let centerY = Float(frame.origin.y + frame.size.height / 2)
-    guard AXUIElementCopyElementAtPosition(application, centerX, centerY, &hit) == .success,
-      let hit
+    guard AXUIElementCopyElementAtPosition(application, centerX, centerY, &probe) == .success,
+      let probe
     else {
       throw DesktopContextProviderError.unavailable
     }
-    try verify(hit, matches: fingerprint)
+    // A hit test resolves to the deepest element at that point, so for a
+    // container target — a conversation list, a file list — the centre lands on
+    // a child rather than on the target itself. The target is then an ancestor
+    // of the hit, so walk back up to it. Identity is still proven by the same
+    // fingerprint check; only the way we relocate the element changed.
+    let hit = try locate(fingerprint, from: probe)
 
     let root: AXUIElement
     let scope: ContextScope
     if requestedScope.requestsConversationSemantics,
-      let conversationRoot = ancestor(
+      let conversationRoot = selfOrAncestor(
         of: hit,
         matchingRoles: ["AXScrollArea", "AXList", "AXTable"],
         maximumDepth: 10
       )
     {
       root = conversationRoot
-      scope = .conversation
+      scope = resolvedScope(for: requestedScope, foundConversationRoot: true)
     } else {
       root = hit
-      scope = fingerprint.frame == nil ? .pointedElement : .semanticRegion
+      scope = resolvedScope(for: requestedScope, foundConversationRoot: false)
     }
 
     var queue: [AXUIElement] = [root]
@@ -217,6 +227,51 @@ public struct AccessibilityContextProvider: ContextProvider {
     return Extraction(text: text, scope: scope, truncated: truncated)
   }
 
+  /// Scope describes the root that was actually proven and traversed, not the
+  /// mere presence of geometry. Every frozen semantic target has a frame, so
+  /// using `frame != nil` to claim `.semanticRegion` widens a pointed-element
+  /// request and causes the broker to reject otherwise valid text. A broader
+  /// scope is reported only when the matching container root was found.
+  static func resolvedScope(
+    for requestedScope: ContextScope,
+    foundConversationRoot: Bool
+  ) -> ContextScope {
+    requestedScope.requestsConversationSemantics && foundConversationRoot
+      ? .conversation
+      : .pointedElement
+  }
+
+  /// Returns the element matching `fingerprint`, starting at the hit-tested
+  /// element and walking up the parent chain when the hit resolved to a
+  /// descendant. Throws `targetChanged` if no ancestor within reach matches, so
+  /// a genuinely moved or replaced target still fails closed.
+  private static func locate(
+    _ fingerprint: AXElementFingerprint,
+    from hit: AXUIElement
+  ) throws -> AXUIElement {
+    var current: AXUIElement? = hit
+    var depth = 0
+    var firstFailure: Error?
+    while let candidate = current, depth <= maximumLocateDepth {
+      do {
+        // `verify` rejects protected content itself, so a protected target
+        // still fails closed. Protection on an unrelated descendant we merely
+        // passed through must not veto the read.
+        try verify(candidate, matches: fingerprint)
+        return candidate
+      } catch DesktopContextProviderError.protectedContent {
+        throw DesktopContextProviderError.protectedContent
+      } catch {
+        if firstFailure == nil { firstFailure = error }
+      }
+      current = elementAttribute(candidate, kAXParentAttribute)
+      depth += 1
+    }
+    throw firstFailure ?? DesktopContextProviderError.targetChanged
+  }
+
+  private static let maximumLocateDepth = 10
+
   private static func verify(
     _ element: AXUIElement,
     matches fingerprint: AXElementFingerprint
@@ -247,14 +302,18 @@ public struct AccessibilityContextProvider: ContextProvider {
     }
   }
 
-  private static func ancestor(
+  /// Returns `element` itself when it already carries one of `roles`, otherwise
+  /// the nearest such ancestor. A conversation target is frequently the list or
+  /// scroll area itself, so skipping straight to the parent would miss it and
+  /// silently narrow the resolved scope.
+  private static func selfOrAncestor(
     of element: AXUIElement,
     matchingRoles roles: Set<String>,
     maximumDepth: Int
   ) -> AXUIElement? {
-    var current = elementAttribute(element, kAXParentAttribute)
+    var current: AXUIElement? = element
     var depth = 0
-    while let candidate = current, depth < maximumDepth {
+    while let candidate = current, depth <= maximumDepth {
       if let role = stringAttribute(candidate, kAXRoleAttribute), roles.contains(role) {
         return candidate
       }

@@ -16,7 +16,7 @@ public protocol ACPWireTransport: Sendable {
   var messages: AsyncThrowingStream<Data, Error> { get }
   func start() throws
   func send(_ data: Data) throws
-  func stop()
+  func stop() async
 }
 
 public final class ACPSubprocessTransport: ACPWireTransport, @unchecked Sendable {
@@ -119,20 +119,18 @@ public final class ACPSubprocessTransport: ACPWireTransport, @unchecked Sendable
     }
   }
 
-  public func stop() {
-    lock.lock()
-    guard !state.finished else {
-      lock.unlock()
-      return
+  public func stop() async {
+    let resources = lock.withLock { () -> (ManagedSubprocess?, FileHandle?)? in
+      guard !state.finished else { return nil }
+      state.stopping = true
+      let resources = (state.process, state.standardInput)
+      state.standardInput = nil
+      return resources
     }
-    state.stopping = true
-    let process = state.process
-    let input = state.standardInput
-    state.standardInput = nil
-    lock.unlock()
+    guard let (process, input) = resources else { return }
 
     try? input?.close()
-    process?.terminate(grace: .seconds(2))
+    await process?.terminateAndWait(grace: .seconds(2))
   }
 
   private func ingest(_ data: Data) {
@@ -228,6 +226,12 @@ public enum ACPConnectionError: Error, Equatable, Sendable {
   case requestTimedOut(method: String)
 }
 
+/// Handles the deliberately narrow set of child-to-Host requests owned by the
+/// embedding product. The ACP transport remains generic and denies every
+/// unregistered request fail-closed.
+public typealias ACPInboundRequestHandler =
+  @Sendable (JSONRPCIncomingMessage) async throws -> JSONValue
+
 public actor ACPConnection {
   private struct AgentMessageProjection {
     var messageID: String?
@@ -235,6 +239,7 @@ public actor ACPConnection {
   }
 
   private let transport: any ACPWireTransport
+  private let inboundRequestHandler: ACPInboundRequestHandler?
   private let codec = NDJSONRPCCodec()
   private var nextRequestID: Int64 = 1
   private var pending: [Int64: CheckedContinuation<JSONValue, Error>] = [:]
@@ -243,11 +248,18 @@ public actor ACPConnection {
   private var closed = false
   private var agentMessageBySession: [String: AgentMessageProjection] = [:]
   private let updateContinuation: AsyncStream<JSONRPCIncomingMessage>.Continuation
+  private var activityContinuations:
+    [UUID: (sessionID: String, continuation: AsyncStream<ACPAgentActivityUpdate>.Continuation)] =
+      [:]
 
   public nonisolated let updates: AsyncStream<JSONRPCIncomingMessage>
 
-  public init(transport: any ACPWireTransport) {
+  public init(
+    transport: any ACPWireTransport,
+    inboundRequestHandler: ACPInboundRequestHandler? = nil
+  ) {
     self.transport = transport
+    self.inboundRequestHandler = inboundRequestHandler
     var captured: AsyncStream<JSONRPCIncomingMessage>.Continuation?
     updates = AsyncStream(bufferingPolicy: .bufferingNewest(128)) { captured = $0 }
     updateContinuation = captured!
@@ -312,14 +324,25 @@ public actor ACPConnection {
     try transport.send(codec.encode(JSONRPCNotification(method: method, params: parameters)))
   }
 
-  public func close() {
+  public func close() async {
     guard !closed else { return }
     closed = true
     readerTask?.cancel()
     readerTask = nil
-    transport.stop()
     failPending(with: ACPConnectionError.closed)
     updateContinuation.finish()
+    finishActivityStreams()
+    await transport.stop()
+  }
+
+  public func activityUpdates(sessionID: String) -> AsyncStream<ACPAgentActivityUpdate> {
+    let subscriptionID = UUID()
+    return AsyncStream(bufferingPolicy: .bufferingNewest(128)) { continuation in
+      activityContinuations[subscriptionID] = (sessionID, continuation)
+      continuation.onTermination = { [weak self] _ in
+        Task { await self?.removeActivityContinuation(id: subscriptionID) }
+      }
+    }
   }
 
   public func takeAgentText(sessionID: String) -> String {
@@ -337,24 +360,33 @@ public actor ACPConnection {
         let message = try codec.decode(line)
         await handle(message)
       }
-      connectionEnded(with: ACPConnectionError.closed)
+      await connectionEnded(with: ACPConnectionError.closed)
     } catch is CancellationError {
       return
     } catch {
-      connectionEnded(with: error)
+      await connectionEnded(with: error)
     }
   }
 
   private func handle(_ message: JSONRPCIncomingMessage) async {
     if let method = message.method {
       if let id = message.id {
-        await denyInboundRequest(id: id, method: method)
+        await handleInboundRequest(message, id: id, method: method)
       } else {
         do {
           try projectAgentText(from: message)
         } catch {
-          connectionEnded(with: error)
+          await connectionEnded(with: error)
           return
+        }
+        let projectedActivities = ACPAgentActivityUpdate.project(message)
+        if !projectedActivities.isEmpty {
+          for activity in projectedActivities {
+            for subscription in activityContinuations.values
+            where subscription.sessionID == activity.sessionID {
+              subscription.continuation.yield(activity)
+            }
+          }
         }
         updateContinuation.yield(message)
       }
@@ -377,6 +409,34 @@ public actor ACPConnection {
       return
     }
     updateContinuation.yield(message)
+  }
+
+  private func handleInboundRequest(
+    _ message: JSONRPCIncomingMessage,
+    id: Int64,
+    method: String
+  ) async {
+    if let inboundRequestHandler {
+      do {
+        let result = try await inboundRequestHandler(message)
+        try transport.send(codec.encode(JSONRPCResponse(id: id, result: result)))
+        return
+      } catch {
+        do {
+          try transport.send(
+            codec.encode(
+              JSONRPCErrorResponse(
+                id: id,
+                code: -32001,
+                message: "Host rejected the Agent request"
+              )))
+        } catch {
+          await connectionEnded(with: error)
+        }
+        return
+      }
+    }
+    await denyInboundRequest(id: id, method: method)
   }
 
   private func projectAgentText(from message: JSONRPCIncomingMessage) throws {
@@ -436,7 +496,7 @@ public actor ACPConnection {
             )))
       }
     } catch {
-      connectionEnded(with: error)
+      await connectionEnded(with: error)
     }
   }
 
@@ -444,12 +504,23 @@ public actor ACPConnection {
     pending.removeValue(forKey: id)?.resume(throwing: CancellationError())
   }
 
-  private func connectionEnded(with error: Error) {
+  private func connectionEnded(with error: Error) async {
     guard !closed else { return }
     closed = true
-    transport.stop()
     failPending(with: error)
     updateContinuation.finish()
+    finishActivityStreams()
+    await transport.stop()
+  }
+
+  private func removeActivityContinuation(id: UUID) {
+    activityContinuations.removeValue(forKey: id)
+  }
+
+  private func finishActivityStreams() {
+    let continuations = activityContinuations.values.map(\.continuation)
+    activityContinuations.removeAll()
+    for continuation in continuations { continuation.finish() }
   }
 
   private func failPending(with error: Error) {

@@ -7,19 +7,25 @@ public struct ContextCaptureRequest: Sendable {
   public let requestedScope: ContextScope
   public let budget: ContextBudget
   public let coherenceGroup: UUID
+  /// Provider classes explicitly selected by the Agent through evidence
+  /// contracts. An empty set preserves the broker's minimum-provider behavior
+  /// for callers that do not require a multimodal bundle.
+  public let requiredProviders: Set<ContextProviderKind>
 
   public init(
     taskID: UUID,
     target: TargetLease,
     requestedScope: ContextScope,
     budget: ContextBudget,
-    coherenceGroup: UUID = UUID()
+    coherenceGroup: UUID = UUID(),
+    requiredProviders: Set<ContextProviderKind> = []
   ) {
     self.taskID = taskID
     self.target = target
     self.requestedScope = requestedScope
     self.budget = budget
     self.coherenceGroup = coherenceGroup
+    self.requiredProviders = requiredProviders
   }
 }
 
@@ -114,6 +120,7 @@ public actor ContextBroker {
     var receipts: [MutationReceipt] = []
     var omissions: [ContextProviderKind: String] = [:]
     var resolvedScope: ContextScope?
+    var resolvedProviders: Set<ContextProviderKind> = []
 
     for provider in providers {
       try Task.checkCancellation()
@@ -137,21 +144,47 @@ public actor ContextBroker {
         var remainingBytes =
           request.budget.maximumBytes
           - artifacts.reduce(0) { $0 + $1.byteCount }
+        var rejectionReasons: [String] = []
         let accepted = Array(outcome.artifacts.prefix(remaining)).filter { artifact in
-          guard artifact.byteCount <= remainingBytes,
-            artifact.taskID == request.taskID,
-            artifact.targetLeaseID == request.target.id,
-            request.requestedScope.encompasses(artifact.scope),
-            artifact.coherenceGroup == request.coherenceGroup,
-            (try? artifact.validate(now: Date())) != nil
-          else {
+          if artifact.byteCount > remainingBytes {
+            rejectionReasons.append("artifact exceeded remaining byte budget")
+            return false
+          }
+          if artifact.taskID != request.taskID {
+            rejectionReasons.append("artifact task binding mismatch")
+            return false
+          }
+          if artifact.targetLeaseID != request.target.id {
+            rejectionReasons.append("artifact target binding mismatch")
+            return false
+          }
+          if !request.requestedScope.encompasses(artifact.scope) {
+            rejectionReasons.append(
+              "artifact scope \(artifact.scope.rawValue) exceeded requested scope \(request.requestedScope.rawValue)"
+            )
+            return false
+          }
+          if artifact.coherenceGroup != request.coherenceGroup {
+            rejectionReasons.append("artifact coherence mismatch")
+            return false
+          }
+          guard (try? artifact.validate(now: Date())) != nil else {
+            rejectionReasons.append("artifact contract validation failed")
             return false
           }
           remainingBytes -= artifact.byteCount
           return true
         }
         guard !accepted.isEmpty else {
-          omissions[provider.kind] = "provider returned no valid artifacts"
+          if outcome.artifacts.isEmpty {
+            omissions[provider.kind] = "provider returned no artifacts"
+          } else {
+            let reasons = Array(Set(rejectionReasons)).sorted().joined(separator: ", ")
+            omissions[provider.kind] =
+              reasons.isEmpty
+              ? "provider returned no valid artifacts"
+              : "provider returned no valid artifacts (\(reasons))"
+          }
           continue
         }
         let acceptedArtifactIDs = Set(accepted.map(\.id))
@@ -173,6 +206,7 @@ public actor ContextBroker {
         }
         artifacts.append(contentsOf: accepted)
         receipts.append(contentsOf: acceptedReceipts)
+        resolvedProviders.insert(provider.kind)
         if let maximum = accepted.map(\.scope).max(by: { lhs, rhs in
           request.requestedScope.coverageDepth(of: lhs) ?? -1
             < request.requestedScope.coverageDepth(of: rhs) ?? -1
@@ -185,7 +219,9 @@ public actor ContextBroker {
             resolvedScope = maximum
           }
         }
-        if resolvedScope == request.requestedScope {
+        if resolvedScope == request.requestedScope,
+          request.requiredProviders.isSubset(of: resolvedProviders)
+        {
           break
         }
       } catch is CancellationError {

@@ -87,7 +87,10 @@ public actor TaskLedger {
 
   private static let allowedTransitions: [TaskState: Set<TaskState>] = [
     .created: [.targetLocked, .failed, .cancelled],
-    .targetLocked: [.contextReady, .degraded, .failed, .cancelled],
+    .targetLocked: [.contextPlanning, .failed, .cancelled],
+    // The Agent may explicitly choose a typed no-context route. The Host must
+    // never infer this transition from user text.
+    .contextPlanning: [.contextReady, .degraded, .agentRunning, .failed, .cancelled],
     .contextReady: [.agentRunning, .failed, .cancelled],
     .degraded: [.agentRunning, .failed, .cancelled],
     .agentRunning: [.awaitingPermission, .executing, .verifying, .succeeded, .failed, .cancelled],

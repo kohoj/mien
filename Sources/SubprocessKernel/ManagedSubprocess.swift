@@ -152,19 +152,53 @@ public final class ManagedSubprocess: @unchecked Sendable {
   }
 
   public func terminate(grace: Duration = .seconds(2)) {
-    lock.lock()
-    guard running, !terminationRequested else {
-      lock.unlock()
-      return
+    guard requestTermination() else { return }
+    Task.detached {
+      await self.forceTerminationAfterGrace(grace)
     }
+  }
+
+  /// Requests graceful termination and does not return until the process has
+  /// been reaped or the post-SIGKILL fence has elapsed. Owners that are about
+  /// to disappear must use this path so the detached grace timer cannot die
+  /// with its parent process and leave an orphan behind.
+  @discardableResult
+  public func terminateAndWait(grace: Duration = .seconds(2)) async -> Bool {
+    guard requestTermination() else { return !isRunning }
+    await forceTerminationAfterGrace(grace)
+    return !isRunning
+  }
+
+  private func requestTermination() -> Bool {
+    lock.lock()
+    guard running else {
+      lock.unlock()
+      return false
+    }
+    let shouldSendSignal = !terminationRequested
     terminationRequested = true
     lock.unlock()
     try? standardInput.close()
-    _ = Darwin.kill(-processIdentifier, SIGTERM)
-    Task.detached {
-      try? await Task.sleep(for: grace)
-      guard self.isRunning else { return }
-      _ = Darwin.kill(-self.processIdentifier, SIGKILL)
+    if shouldSendSignal {
+      _ = Darwin.kill(-processIdentifier, SIGTERM)
+    }
+    return true
+  }
+
+  private func forceTerminationAfterGrace(_ grace: Duration) async {
+    let clock = ContinuousClock()
+    let gracefulDeadline = clock.now.advanced(by: grace)
+    while isRunning, clock.now < gracefulDeadline {
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    guard isRunning else { return }
+    _ = Darwin.kill(-processIdentifier, SIGKILL)
+
+    // `wait()` owns reaping and flips `running`. Bound this second wait so
+    // teardown itself can never hang on a broken platform boundary.
+    let reapDeadline = clock.now.advanced(by: .seconds(2))
+    while isRunning, clock.now < reapDeadline {
+      try? await Task.sleep(for: .milliseconds(20))
     }
   }
 

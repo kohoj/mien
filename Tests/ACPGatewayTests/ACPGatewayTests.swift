@@ -1,6 +1,7 @@
 import ACPGateway
 import CryptoKit
 import Foundation
+import MienContracts
 import XCTest
 
 final class ACPGatewayTests: XCTestCase {
@@ -42,7 +43,7 @@ final class ACPGatewayTests: XCTestCase {
       try ACPProcessSupervisor(
         configuration: ACPProcessConfiguration(
           executableURL: URL(
-            fileURLWithPath: "/Applications/Product.app/Contents/Helpers/codex-acp"),
+            fileURLWithPath: "/Applications/Product.app/Contents/Helpers/mien-pi-agent"),
           workingDirectoryURL: URL(fileURLWithPath: "/tmp/task"),
           environment: ["APP_SERVER_LOGS": "/tmp/private"]
         ))
@@ -54,7 +55,7 @@ final class ACPGatewayTests: XCTestCase {
       try ACPProcessSupervisor(
         configuration: ACPProcessConfiguration(
           executableURL: URL(
-            fileURLWithPath: "/Applications/Product.app/Contents/Helpers/codex-acp"),
+            fileURLWithPath: "/Applications/Product.app/Contents/Helpers/mien-pi-agent"),
           workingDirectoryURL: URL(fileURLWithPath: "/tmp/task"),
           expectedExecutableSHA256: "not-a-digest"
         )
@@ -92,7 +93,8 @@ final class ACPGatewayTests: XCTestCase {
 
   func testSupervisorNegotiatesBeforeReadyAndCircuitBreaksRestarts() async throws {
     let configuration = ACPProcessConfiguration(
-      executableURL: URL(fileURLWithPath: "/Applications/Product.app/Contents/Helpers/codex-acp"),
+      executableURL: URL(
+        fileURLWithPath: "/Applications/Product.app/Contents/Helpers/mien-pi-agent"),
       workingDirectoryURL: URL(fileURLWithPath: "/tmp/task"),
       maximumRestartsPerMinute: 2
     )
@@ -135,6 +137,29 @@ final class ACPGatewayTests: XCTestCase {
       try await Task.sleep(for: .milliseconds(1))
     }
     XCTAssertTrue(transport.containsCancelledPermissionResponse)
+    await connection.close()
+  }
+
+  func testConnectionRoutesOnlyRegisteredChildRequestsAndReturnsTypedResult() async throws {
+    let transport = LoopbackTransport()
+    let connection = ACPConnection(
+      transport: transport,
+      inboundRequestHandler: { message in
+        guard message.method == "mien/request_context" else {
+          throw ACPConnectionError.invalidResult
+        }
+        return .object(["accepted": .bool(true)])
+      }
+    )
+    try await connection.start()
+
+    transport.sendContextRequest()
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while !transport.containsAcceptedContextResponse, ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(1))
+    }
+
+    XCTAssertTrue(transport.containsAcceptedContextResponse)
     await connection.close()
   }
 
@@ -200,24 +225,174 @@ final class ACPGatewayTests: XCTestCase {
     XCTAssertTrue(text.contains("\"type\":\"resource_link\""))
   }
 
-  func testLiveCodexACPHandshakeWhenExplicitlyEnabled() async throws {
-    let environment = ProcessInfo.processInfo.environment
-    guard environment["RUN_ACP_LIVE_SMOKE"] == "1" else {
-      throw XCTSkip("set RUN_ACP_LIVE_SMOKE=1 to exercise the pinned nested runtime")
+  func testActivityProjectionNeverExposesThoughtContent() throws {
+    let message = try NDJSONRPCCodec().decode(
+      Data(
+        #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_thought_chunk","messageId":"thought-7","content":{"type":"text","text":"private reasoning must not appear"}}}}"#
+          .utf8
+      )
+    )
+
+    let activity = try XCTUnwrap(ACPAgentActivityUpdate.project(message).only)
+
+    XCTAssertEqual(activity.id, "thought:thought-7")
+    XCTAssertEqual(activity.kind, .thinking)
+    XCTAssertEqual(activity.status, .active)
+    XCTAssertNil(activity.title)
+  }
+
+  func testActivityProjectionUsesTypedToolIdentityAndStatusOnly() throws {
+    let message = try NDJSONRPCCodec().decode(
+      Data(
+        #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-42","title":"Read current conversation","status":"completed","rawInput":{"secret":"never project"},"rawOutput":"never project"}}}"#
+          .utf8
+      )
+    )
+
+    let activity = try XCTUnwrap(ACPAgentActivityUpdate.project(message).only)
+
+    XCTAssertEqual(activity.id, "tool:call-42")
+    XCTAssertEqual(activity.kind, .tool)
+    XCTAssertNil(activity.toolName)
+    XCTAssertEqual(activity.title, "Read current conversation")
+    XCTAssertEqual(activity.status, .completed)
+  }
+
+  func testActivityProjectionPreservesExactToolNameWithoutRawArguments() throws {
+    let message = try NDJSONRPCCodec().decode(
+      Data(
+        #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"tool_call","toolCallId":"call-9","name":"request_context","title":"request_context(scope: conversation, evidence: [accessibility])","status":"in_progress","rawInput":{"content":"never project"}}}}"#
+          .utf8
+      )
+    )
+
+    let activity = try XCTUnwrap(ACPAgentActivityUpdate.project(message).only)
+
+    XCTAssertEqual(activity.toolName, "request_context")
+    XCTAssertEqual(
+      activity.title,
+      "request_context(scope: conversation, evidence: [accessibility])"
+    )
+    XCTAssertEqual(activity.status, .active)
+  }
+
+  func testThoughtLifecycleCanCompleteWithoutExposingThoughtContent() throws {
+    let message = try NDJSONRPCCodec().decode(
+      Data(
+        #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"agent_thought_chunk","messageId":"thinking","content":{"type":"text","text":"private reasoning"},"status":"completed"}}}"#
+          .utf8
+      )
+    )
+
+    let activity = try XCTUnwrap(ACPAgentActivityUpdate.project(message).only)
+
+    XCTAssertEqual(activity.id, "thought:thinking")
+    XCTAssertNil(activity.title)
+    XCTAssertEqual(activity.status, .completed)
+  }
+
+  func testActivityProjectionMapsPlanEntriesWithoutInventingProgress() throws {
+    let message = try NDJSONRPCCodec().decode(
+      Data(
+        #"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"session-1","update":{"sessionUpdate":"plan","entries":[{"content":"Inspect evidence","status":"completed"},{"content":"Compose answer","status":"pending"}]}}}"#
+          .utf8
+      )
+    )
+
+    let activities = ACPAgentActivityUpdate.project(message)
+
+    XCTAssertEqual(activities.map(\.id), ["plan:0", "plan:1"])
+    XCTAssertEqual(activities.map(\.status), [.completed, .active])
+    XCTAssertEqual(activities.map(\.title), ["Inspect evidence", "Compose answer"])
+  }
+
+  func testSessionModelCatalogComesOnlyFromTypedACPConfiguration() throws {
+    let data = Data(
+      #"""
+      {"sessionId":"session-1","configOptions":[
+        {"id":"mode","name":"Mode","type":"select","category":"mode","currentValue":"default","options":[]},
+        {"id":"model","name":"Model","description":"Session model","category":"model","type":"select","currentValue":"gpt-primary","options":[
+          {"value":"gpt-primary","name":"Primary","description":"Deep work"},
+          {"value":"gpt-fast","name":"Fast","description":null}
+        ]}
+      ]}
+      """#.utf8
+    )
+    let result = try JSONDecoder().decode(ACPNewSessionResult.self, from: data)
+
+    let configuration = try result.agentModelConfiguration()
+
+    XCTAssertEqual(configuration.configID, "model")
+    XCTAssertEqual(configuration.catalog.currentModelID, "gpt-primary")
+    XCTAssertEqual(
+      configuration.catalog.options,
+      [
+        AgentModelOption(id: "gpt-primary", name: "Primary", description: "Deep work"),
+        AgentModelOption(id: "gpt-fast", name: "Fast"),
+      ]
+    )
+  }
+
+  func testMalformedOrMissingModelConfigurationFailsClosed() throws {
+    let missing = try JSONDecoder().decode(
+      ACPNewSessionResult.self,
+      from: Data(#"{"sessionId":"session-1"}"#.utf8)
+    )
+    XCTAssertThrowsError(try missing.agentModelConfiguration()) { error in
+      XCTAssertEqual(error as? ACPModelConfigurationError, .unavailable)
     }
-    let executable = try XCTUnwrap(environment["ACP_EXECUTABLE"])
-    let codexPath = try XCTUnwrap(environment["ACP_CODEX_PATH"])
-    let codexHomePath = try XCTUnwrap(environment["ACP_CODEX_HOME_PATH"])
+
+    let malformed = try JSONDecoder().decode(
+      ACPNewSessionResult.self,
+      from: Data(
+        #"""
+        {"sessionId":"session-1","configOptions":[
+          {"id":"model","name":"Model","category":"model","type":"select","currentValue":"missing","options":[
+            {"value":"present","name":"Present"}
+          ]}
+        ]}
+        """#.utf8
+      )
+    )
+    XCTAssertThrowsError(try malformed.agentModelConfiguration()) { error in
+      XCTAssertEqual(error as? ACPModelConfigurationError, .malformed)
+    }
+  }
+
+  func testModelSelectionUsesStandardACPConfigMethodAndValueID() throws {
+    let request = JSONRPCRequest(
+      id: 8,
+      method: "session/set_config_option",
+      params: ACPSetSessionConfigOptionParameters(
+        sessionId: "session-1",
+        configId: "model",
+        value: "gpt-primary"
+      )
+    )
+    let text = try XCTUnwrap(
+      String(data: NDJSONRPCCodec().encode(request), encoding: .utf8)
+    )
+
+    XCTAssertTrue(text.contains("\"method\":\"session/set_config_option\""))
+    XCTAssertTrue(text.contains("\"configId\":\"model\""))
+    XCTAssertTrue(text.contains("\"value\":\"gpt-primary\""))
+    XCTAssertFalse(text.contains("set_model"))
+  }
+
+  func testLivePiAgentHandshakeWhenExplicitlyEnabled() async throws {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["RUN_PI_AGENT_LIVE_SMOKE"] == "1" else {
+      throw XCTSkip("set RUN_PI_AGENT_LIVE_SMOKE=1 to exercise the pinned Pi runtime")
+    }
+    let executable = try XCTUnwrap(environment["PI_AGENT_EXECUTABLE"])
+    let agentDirectory = try XCTUnwrap(environment["PI_AGENT_DIR"])
     let runtime = try ACPClientRuntime(
       configuration: ACPProcessConfiguration(
         executableURL: URL(fileURLWithPath: executable),
         workingDirectoryURL: FileManager.default.temporaryDirectory,
         environment: [
           "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-          "CODEX_PATH": codexPath,
-          "CODEX_HOME": codexHomePath,
-          "NO_BROWSER": "1",
-          "INITIAL_AGENT_MODE": "read-only",
+          "PI_AGENT_DIR": agentDirectory,
         ]
       ),
       clientInfo: ACPImplementation(
@@ -231,46 +406,10 @@ final class ACPGatewayTests: XCTestCase {
     XCTAssertEqual(result.protocolVersion, ACPProtocolV1.version)
     await runtime.stop()
   }
+}
 
-  func testLiveCodexACPTurnWhenExplicitlyEnabled() async throws {
-    let environment = ProcessInfo.processInfo.environment
-    guard environment["RUN_ACP_LIVE_PROMPT"] == "1" else {
-      throw XCTSkip("set RUN_ACP_LIVE_PROMPT=1 to exercise a real Codex turn")
-    }
-    let executable = try XCTUnwrap(environment["ACP_EXECUTABLE"])
-    let codexPath = try XCTUnwrap(environment["ACP_CODEX_PATH"])
-    let codexHomePath = try XCTUnwrap(environment["ACP_CODEX_HOME_PATH"])
-    let runtime = try ACPClientRuntime(
-      configuration: ACPProcessConfiguration(
-        executableURL: URL(fileURLWithPath: executable),
-        workingDirectoryURL: FileManager.default.temporaryDirectory,
-        environment: [
-          "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-          "CODEX_PATH": codexPath,
-          "CODEX_HOME": codexHomePath,
-          "NO_BROWSER": "1",
-          "INITIAL_AGENT_MODE": "read-only",
-        ]
-      ),
-      clientInfo: ACPImplementation(
-        name: "mien-tests",
-        title: "Mien Tests",
-        version: "0.1.0"
-      )
-    )
-
-    _ = try await runtime.start()
-    let session = try await runtime.newSession(
-      workingDirectory: FileManager.default.temporaryDirectory
-    )
-    let result = try await runtime.promptCollectingText(
-      sessionID: session.sessionId,
-      content: [.text("Reply with exactly: READY")]
-    )
-    XCTAssertEqual(result.stopReason, .endTurn)
-    XCTAssertEqual(result.text.trimmingCharacters(in: .whitespacesAndNewlines), "READY")
-    await runtime.stop()
-  }
+extension Array {
+  fileprivate var only: Element? { count == 1 ? self[0] : nil }
 }
 
 private final class LoopbackTransport: ACPWireTransport, @unchecked Sendable {
@@ -313,7 +452,7 @@ private final class LoopbackTransport: ACPWireTransport, @unchecked Sendable {
     continuation.yield(try JSONSerialization.data(withJSONObject: response))
   }
 
-  func stop() {
+  func stop() async {
     continuation.finish()
   }
 
@@ -331,6 +470,16 @@ private final class LoopbackTransport: ACPWireTransport, @unchecked Sendable {
     continuation.yield(try! JSONSerialization.data(withJSONObject: request))
   }
 
+  func sendContextRequest() {
+    let request: [String: Any] = [
+      "jsonrpc": "2.0",
+      "id": 100,
+      "method": "mien/request_context",
+      "params": ["sessionId": "session-1"],
+    ]
+    continuation.yield(try! JSONSerialization.data(withJSONObject: request))
+  }
+
   var containsCancelledPermissionResponse: Bool {
     lock.lock()
     defer { lock.unlock() }
@@ -343,6 +492,20 @@ private final class LoopbackTransport: ACPWireTransport, @unchecked Sendable {
         return false
       }
       return outcome["outcome"] as? String == "cancelled"
+    }
+  }
+
+  var containsAcceptedContextResponse: Bool {
+    lock.lock()
+    defer { lock.unlock() }
+    return responses.contains { data in
+      guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        object["id"] as? Int == 100,
+        let result = object["result"] as? [String: Any]
+      else {
+        return false
+      }
+      return result["accepted"] as? Bool == true
     }
   }
 

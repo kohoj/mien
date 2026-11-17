@@ -3,6 +3,7 @@ import Foundation
 public enum TaskState: String, Codable, CaseIterable, Sendable {
   case created
   case targetLocked
+  case contextPlanning
   case contextReady
   case degraded
   case agentRunning

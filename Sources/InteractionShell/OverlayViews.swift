@@ -2,364 +2,265 @@ import AppKit
 import Foundation
 import MienContracts
 
+/// Layout values for the transient AppKit panel. Visual appearance is owned by
+/// shared native palette, system typeface and AppKit control semantics.
+enum OverlayMetrics {
+  static let panelWidth = 520.0
+  static let cornerRadius = 18.0
+  static let padding = 20.0
+  static let contentInset = 0.0
+  static let topInset = 44.0
+  static let bottomInset = 16.0
+  static let rowSpacing = 16.0
+  static let controlHeight = 32.0
+  static let inputPadding = 12.0
+  static let composerGap = 16.0
+  static let controlHitSize = 28.0
+  static let maximumComposerHeight = 96.0
+  static let maximumPanelHeight = 580.0
+
+  @MainActor static var resultLineHeight: Double {
+    let font = OverlayTypography.response
+    return (font.ascender - font.descender + font.leading).rounded(.up)
+  }
+
+  /// The compact escape controls are fixed; the conversation owns the rest.
+  static func chromeHeight(includesAction: Bool) -> Double {
+    topInset + bottomInset
+  }
+}
+
+/// System typefaces preserve native script fallback; deliberate size/weight
+/// relationships distinguish the question, reading surface and input control.
+@MainActor
+enum OverlayTypography {
+  static let user = NSFont.systemFont(ofSize: 13, weight: .medium)
+  static let response = NSFont.systemFont(ofSize: 15, weight: .regular)
+  static let input = NSFont.systemFont(ofSize: 15, weight: .regular)
+  static let activity = NSFont.systemFont(ofSize: 12, weight: .medium)
+  static let status = preferred(.callout)
+  static let context = NSFont.systemFont(ofSize: 11, weight: .medium)
+
+  private static func preferred(_ style: NSFont.TextStyle) -> NSFont {
+    NSFont.preferredFont(forTextStyle: style, options: [:])
+  }
+}
+
 @MainActor
 final class NonactivatingPanel: NSPanel {
+  var onCancel: (() -> Void)?
+  var onSettings: (() -> Void)?
+
   override var canBecomeKey: Bool { true }
   override var canBecomeMain: Bool { false }
-}
 
-@MainActor
-final class SemanticLensView: NSView {
-  override var isFlipped: Bool { true }
+  // Native Window-menu closure must enter the same task cancellation/cleanup
+  // boundary as Escape, rather than close an untracked NSPanel directly.
+  override func performClose(_ sender: Any?) { onCancel?() }
 
-  override func isAccessibilityElement() -> Bool { false }
-
-  override func draw(_ dirtyRect: NSRect) {
-    super.draw(dirtyRect)
-    let path = NSBezierPath(
-      roundedRect: bounds.insetBy(dx: 1.5, dy: 1.5),
-      xRadius: 9,
-      yRadius: 9
-    )
-    path.lineWidth = 1.25
-    NSColor.controlAccentColor.withAlphaComponent(0.88).setStroke()
-    path.stroke()
-  }
-}
-
-@MainActor
-final class ComposerViewController: NSViewController, NSTextFieldDelegate {
-  var onSubmit: ((String) -> Void)?
-  var onCancel: (() -> Void)?
-  var onResultAction: ((TaskPresentationAction) -> Void)?
-
-  private let intentField = NSTextField()
-  private let submitButton = NSButton()
-  private let contextLabel = NSTextField(labelWithString: "")
-  private let statusLabel = NSTextField(labelWithString: "")
-  private let resultLabel = NSTextField(labelWithString: "")
-  private let resultActionButton = NSButton()
-  private var acceptsSubmission = true
-  private var baseContext = ""
-  private var resultAction: TaskPresentationAction?
-  private var resultHeightConstraint: NSLayoutConstraint?
-
-  override func loadView() {
-    let effect = NSVisualEffectView()
-    effect.material = .hudWindow
-    effect.blendingMode = .behindWindow
-    effect.state = .active
-    effect.wantsLayer = true
-    effect.layer?.cornerRadius = 13
-    effect.layer?.cornerCurve = .continuous
-    effect.layer?.borderWidth = 0.5
-    effect.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.7).cgColor
-
-    intentField.placeholderString = "想让它做什么？"
-    intentField.font = .systemFont(ofSize: 14.5, weight: .regular)
-    intentField.textColor = .labelColor
-    intentField.backgroundColor = NSColor.black.withAlphaComponent(0.16)
-    intentField.isBezeled = true
-    intentField.bezelStyle = .roundedBezel
-    intentField.focusRingType = .default
-    intentField.delegate = self
-    intentField.translatesAutoresizingMaskIntoConstraints = false
-    intentField.setAccessibilityLabel("操作意图")
-    intentField.setAccessibilityHelp("输入希望 Codex 对当前内容完成的任务")
-
-    submitButton.bezelStyle = .circular
-    submitButton.controlSize = .large
-    submitButton.image = NSImage(
-      systemSymbolName: "arrow.turn.down.left",
-      accessibilityDescription: "运行"
-    )
-    submitButton.imagePosition = .imageOnly
-    submitButton.bezelColor = .systemBlue
-    submitButton.contentTintColor = .white
-    submitButton.target = self
-    submitButton.action = #selector(submitIntent)
-    submitButton.isEnabled = false
-    submitButton.translatesAutoresizingMaskIntoConstraints = false
-    submitButton.setAccessibilityLabel("运行")
-    submitButton.setAccessibilityHelp("使用当前授权上下文运行输入的任务")
-
-    contextLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
-    contextLabel.textColor = .secondaryLabelColor
-    contextLabel.lineBreakMode = .byTruncatingMiddle
-    contextLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-    contextLabel.translatesAutoresizingMaskIntoConstraints = false
-    contextLabel.setAccessibilityLabel("当前上下文")
-
-    statusLabel.font = .systemFont(ofSize: 11.5, weight: .medium)
-    statusLabel.textColor = .tertiaryLabelColor
-    statusLabel.alignment = .right
-    statusLabel.lineBreakMode = .byTruncatingHead
-    statusLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
-    statusLabel.translatesAutoresizingMaskIntoConstraints = false
-    statusLabel.setAccessibilityLabel("任务状态")
-
-    resultLabel.font = .systemFont(ofSize: 13.5, weight: .regular)
-    resultLabel.textColor = .labelColor
-    resultLabel.maximumNumberOfLines = 4
-    resultLabel.lineBreakMode = .byTruncatingTail
-    resultLabel.preferredMaxLayoutWidth = 366
-    resultLabel.cell?.wraps = true
-    resultLabel.cell?.usesSingleLineMode = false
-    resultLabel.isSelectable = true
-    resultLabel.isHidden = true
-    resultLabel.translatesAutoresizingMaskIntoConstraints = false
-    resultLabel.setAccessibilityLabel("Codex 结果")
-
-    resultActionButton.bezelStyle = .rounded
-    resultActionButton.controlSize = .large
-    resultActionButton.font = .systemFont(ofSize: 12.5, weight: .semibold)
-    resultActionButton.target = self
-    resultActionButton.action = #selector(performResultAction)
-    resultActionButton.keyEquivalent = "\r"
-    resultActionButton.keyEquivalentModifierMask = [.command]
-    resultActionButton.isHidden = true
-    resultActionButton.translatesAutoresizingMaskIntoConstraints = false
-
-    let metadata = NSStackView(views: [contextLabel, statusLabel])
-    metadata.orientation = .horizontal
-    metadata.alignment = .centerY
-    metadata.distribution = .fill
-    metadata.spacing = 8
-    metadata.translatesAutoresizingMaskIntoConstraints = false
-
-    let actionRow = NSStackView(views: [NSView(), resultActionButton])
-    actionRow.orientation = .horizontal
-    actionRow.alignment = .centerY
-    actionRow.distribution = .fill
-    actionRow.translatesAutoresizingMaskIntoConstraints = false
-
-    let inputRow = NSStackView(views: [intentField, submitButton])
-    inputRow.orientation = .horizontal
-    inputRow.alignment = .centerY
-    inputRow.distribution = .fill
-    inputRow.spacing = 7
-    inputRow.translatesAutoresizingMaskIntoConstraints = false
-
-    let stack = NSStackView(views: [inputRow, resultLabel, actionRow, metadata])
-    stack.orientation = .vertical
-    stack.alignment = .width
-    stack.spacing = 8
-    stack.translatesAutoresizingMaskIntoConstraints = false
-    effect.addSubview(stack)
-    let resultHeightConstraint = resultLabel.heightAnchor.constraint(
-      greaterThanOrEqualToConstant: 48
-    )
-    resultHeightConstraint.priority = .defaultHigh
-    self.resultHeightConstraint = resultHeightConstraint
-    NSLayoutConstraint.activate([
-      stack.leadingAnchor.constraint(equalTo: effect.leadingAnchor, constant: 12),
-      stack.trailingAnchor.constraint(equalTo: effect.trailingAnchor, constant: -12),
-      stack.topAnchor.constraint(equalTo: effect.topAnchor, constant: 11),
-      stack.bottomAnchor.constraint(equalTo: effect.bottomAnchor, constant: -10),
-      inputRow.heightAnchor.constraint(equalToConstant: 34),
-      submitButton.widthAnchor.constraint(equalToConstant: 30),
-      submitButton.heightAnchor.constraint(equalToConstant: 30),
-      resultActionButton.heightAnchor.constraint(equalToConstant: 30),
-      resultActionButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 118),
-      contextLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 190),
-    ])
-    view = effect
-  }
-
-  func configure(context: String, intent: String = "") {
-    acceptsSubmission = true
-    intentField.isEditable = true
-    intentField.stringValue = intent
-    submitButton.isEnabled = !intent.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    baseContext = context
-    contextLabel.stringValue = context
-    statusLabel.stringValue = "Return 运行"
-    resultLabel.stringValue = ""
-    resultLabel.isHidden = true
-    resultHeightConstraint?.isActive = false
-    resultAction = nil
-    resultActionButton.isHidden = true
-  }
-
-  func setContextDisclosure(_ disclosure: String) {
-    contextLabel.stringValue = "\(baseContext) · \(disclosure)"
-    contextLabel.setAccessibilityValue(contextLabel.stringValue)
-    NSAccessibility.post(element: contextLabel, notification: .valueChanged)
-  }
-
-  func focusInput() {
-    view.window?.makeFirstResponder(intentField)
-  }
-
-  func setStatus(_ text: String, allowsRetry: Bool = false) {
-    statusLabel.stringValue = text
-    statusLabel.setAccessibilityValue(text)
-    NSAccessibility.post(element: statusLabel, notification: .valueChanged)
-    if allowsRetry {
-      acceptsSubmission = true
-      intentField.isEditable = true
-      submitButton.isEnabled = !intentField.stringValue.trimmingCharacters(
-        in: .whitespacesAndNewlines
-      ).isEmpty
-      focusInput()
+  override func performKeyEquivalent(with event: NSEvent) -> Bool {
+    let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+    if event.charactersIgnoringModifiers == ",", modifiers == .command {
+      onSettings?()
+      return true
     }
-  }
-
-  func beginRunning() {
-    acceptsSubmission = false
-    intentField.isEditable = false
-    submitButton.isEnabled = false
-    setStatus("上下文已冻结")
-  }
-
-  func showResult(
-    _ text: String,
-    status: String,
-    action: TaskPresentationAction? = nil
-  ) {
-    resultLabel.stringValue = text
-    resultLabel.isHidden = false
-    resultHeightConstraint?.isActive = true
-    resultAction = action
-    switch action {
-    case .insertDraft:
-      resultActionButton.title = "插入原输入框"
-      resultActionButton.bezelColor = .systemBlue
-      resultActionButton.contentTintColor = .white
-      resultActionButton.toolTip = "仅写入草稿，不会发送（⌘Return）"
-      resultActionButton.setAccessibilityLabel("插入原输入框")
-      resultActionButton.setAccessibilityHelp("把草稿写入原输入框，但不会发送")
-      resultActionButton.isHidden = false
-    case .undoDraft:
-      resultActionButton.title = "撤销插入"
-      resultActionButton.bezelColor = nil
-      resultActionButton.contentTintColor = .labelColor
-      resultActionButton.toolTip = "仅当输入框未被继续修改时恢复原内容（⌘Return）"
-      resultActionButton.setAccessibilityLabel("撤销插入")
-      resultActionButton.setAccessibilityHelp("输入框未被继续修改时恢复插入前内容")
-      resultActionButton.isHidden = false
-    case .loginCodex:
-      resultActionButton.title = "登录 Codex"
-      resultActionButton.bezelColor = .systemBlue
-      resultActionButton.contentTintColor = .white
-      resultActionButton.toolTip = "使用 ChatGPT 账户完成设备授权（⌘Return）"
-      resultActionButton.setAccessibilityLabel("登录 Codex")
-      resultActionButton.setAccessibilityHelp("在浏览器中完成 Codex 设备授权")
-      resultActionButton.isHidden = false
-    case nil:
-      resultActionButton.isHidden = true
+    if event.charactersIgnoringModifiers == "w", modifiers == .command {
+      performClose(nil)
+      return true
     }
-    statusLabel.stringValue = status
-    statusLabel.setAccessibilityValue(status)
-    NSAccessibility.post(element: resultLabel, notification: .valueChanged)
-  }
-
-  @objc private func performResultAction() {
-    guard let resultAction else { return }
-    resultActionButton.isEnabled = false
-    onResultAction?(resultAction)
-  }
-
-  @objc private func submitIntent() {
-    let text = intentField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard acceptsSubmission, !text.isEmpty else { return }
-    onSubmit?(text)
-  }
-
-  func controlTextDidChange(_ notification: Notification) {
-    submitButton.isEnabled =
-      acceptsSubmission
-      && !intentField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-  }
-
-  func setResultActionEnabled(_ enabled: Bool) {
-    resultActionButton.isEnabled = enabled
-  }
-
-  func showActionPrompt(status: String, action: TaskPresentationAction) {
-    resultLabel.stringValue = ""
-    resultLabel.isHidden = true
-    showResult("", status: status, action: action)
-    resultLabel.isHidden = true
-    resultHeightConstraint?.isActive = false
-  }
-
-  func control(
-    _ control: NSControl,
-    textView: NSTextView,
-    doCommandBy commandSelector: Selector
-  ) -> Bool {
-    if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+    if event.charactersIgnoringModifiers == "\u{1b}",
+      modifiers.subtracting([.capsLock, .numericPad]).isEmpty
+    {
       onCancel?()
       return true
     }
-    if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-      let text = intentField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-      guard acceptsSubmission, !text.isEmpty, !textView.hasMarkedText() else { return true }
-      submitIntent()
-      return true
-    }
-    return false
+    return super.performKeyEquivalent(with: event)
   }
+}
+
+@MainActor
+final class SemanticLensView: NSBox {
+  override func isAccessibilityElement() -> Bool { false }
+
+  override init(frame frameRect: NSRect) {
+    super.init(frame: frameRect)
+    boxType = .custom
+    borderWidth = 1
+    cornerRadius = 7
+    borderColor = .keyboardFocusIndicatorColor
+    fillColor = .clear
+  }
+
+  required init?(coder: NSCoder) { nil }
 }
 
 public enum OverlayPreviewState: String, CaseIterable, Sendable {
   case composing
+  case conversation
   case draft
   case undo
   case login
+  case failure
 }
 
 @MainActor
 public enum OverlayPreviewRenderer {
-  public static func png(state: OverlayPreviewState) throws -> Data {
-    let height: CGFloat =
-      switch state {
-      case .composing: 86
-      case .draft, .undo: 194
-      case .login: 126
-      }
-    let size = NSSize(width: 390, height: height)
+  public static func png(state: OverlayPreviewState, appearance: NSAppearance.Name = .aqua) throws
+    -> Data
+  {
+    let width = OverlayMetrics.panelWidth
     let window = NSWindow(
-      contentRect: NSRect(origin: .zero, size: size),
+      contentRect: NSRect(x: 0, y: 0, width: width, height: 200),
       styleMask: [.borderless],
       backing: .buffered,
       defer: false
     )
-    window.appearance = NSAppearance(named: .darkAqua)
+    window.appearance = NSAppearance(named: appearance)
     window.backgroundColor = .clear
     window.isOpaque = false
     let controller = ComposerViewController()
     window.contentViewController = controller
-    controller.configure(context: "微信 · 当前对话", intent: "结合前文，帮我礼貌拒绝")
+    window.setContentSize(NSSize(width: width, height: 200))
+    controller.view.frame = NSRect(x: 0, y: 0, width: width, height: 200)
+    controller.view.layoutSubtreeIfNeeded()
+    controller.configure(context: "微信", intent: "这段讨论的结论是什么？")
     switch state {
     case .composing:
-      break
-    case .draft:
+      controller.configure(context: "微信", intent: "帮我理清这里的重点")
+    case .conversation:
       controller.beginRunning()
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "thinking:one",
+          kind: .thinking,
+          toolName: nil,
+          status: .completed
+        )
+      )
+      controller.showResult(
+        "先把核心体验做轻。\n\n大家达成了两个共识：**缩短第一次使用的路径**，以及让每一步的结果都清楚可见。\n\n下一步先做一个小范围试用，再决定是否继续扩展。",
+        status: "已完成"
+      )
+      RunLoop.current.run(until: Date().addingTimeInterval(0.85))
+      controller.settleMotionForRendering()
+      controller.setComposerTextForPreview("帮我写一句回复")
+      controller.beginRunning()
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "thinking:two",
+          kind: .thinking,
+          toolName: nil,
+          status: .completed
+        )
+      )
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "tool:deployment",
+          kind: .tool,
+          toolName: "request_context",
+          status: .completed
+        )
+      )
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "thinking:two",
+          kind: .thinking,
+          toolName: nil,
+          status: .active
+        )
+      )
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "thinking:two",
+          kind: .thinking,
+          toolName: nil,
+          status: .completed
+        )
+      )
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "tool:verify",
+          kind: .tool,
+          toolName: "submit_outcome",
+          status: .completed
+        )
+      )
+      controller.showResult(
+        "赞同。先让一个完整的体验成立，再根据真实使用反馈往前走。",
+        status: "已完成"
+      )
+      RunLoop.current.run(until: Date().addingTimeInterval(0.48))
+      controller.settleMotionForRendering()
+      controller.showCaretForPreview()
+    case .draft, .undo:
+      controller.beginRunning(submittedText: "帮我婉拒这次邀请")
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "thinking",
+          kind: .thinking,
+          toolName: nil,
+          status: .completed
+        )
+      )
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "tool:context",
+          kind: .tool,
+          toolName: "request_context",
+          status: .completed
+        )
+      )
       controller.setContextDisclosure("对话 · 辅助功能 + 长图 · Codex 将使用")
       controller.showResult(
         "感谢你的理解和信任，不过这个时间我可能不太合适参与。希望下次有更合适的机会，再一起合作。",
-        status: "草稿已生成",
-        action: .insertDraft
+        status: state == .draft ? "草稿已生成" : "已插入 · 可撤销",
+        action: state == .draft ? .insertDraft : .undoDraft
       )
-    case .undo:
-      controller.beginRunning()
-      controller.setContextDisclosure("对话 · 辅助功能 + 长图 · Codex 将使用")
-      controller.showResult(
-        "感谢你的理解和信任，不过这个时间我可能不太合适参与。希望下次有更合适的机会，再一起合作。",
-        status: "已插入 · 可撤销",
-        action: .undoDraft
-      )
+      // Let the same completion animation used in the live product settle so
+      // the preview captures the final icon-only process state.
+      RunLoop.current.run(until: Date().addingTimeInterval(0.85))
+      controller.settleMotionForRendering()
     case .login:
       controller.beginRunning()
       controller.showActionPrompt(status: "登录后继续当前任务", action: .loginCodex)
+      controller.settleMotionForRendering()
+    case .failure:
+      controller.beginRunning()
+      controller.presentActivity(
+        AgentActivityPresentation(
+          id: "tool:context",
+          kind: .tool,
+          toolName: "request_context",
+          status: .failed
+        )
+      )
+      controller.setStatus("无法读取更早的内容", allowsRetry: true)
+      controller.settleMotionForRendering()
+      RunLoop.current.run(until: Date().addingTimeInterval(0.30))
     }
 
+    let size = NSSize(
+      width: width,
+      height: controller.preferredPanelHeight(limit: 600)
+    )
     window.setContentSize(size)
     controller.view.frame = NSRect(origin: .zero, size: size)
     window.layoutIfNeeded()
     controller.view.layoutSubtreeIfNeeded()
+    window.displayIfNeeded()
+    // Resizing can bring a reused historical row into view and start a fresh
+    // WebKit load. Snapshot only after the real visible typesetters are ready.
+    let deadline = Date().addingTimeInterval(4)
+    func renderers(in view: NSView) -> [ResultWebRendererView] {
+      view.subviews.flatMap { child in
+        (child as? ResultWebRendererView).map { [$0] } ?? renderers(in: child)
+      }
+    }
+    while renderers(in: controller.view).contains(where: { !$0.isReadyForSnapshot }) {
+      guard Date() < deadline else { throw CocoaError(.coderValueNotFound) }
+      RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+      controller.view.layoutSubtreeIfNeeded()
+    }
     window.displayIfNeeded()
     guard
       let representation = controller.view.bitmapImageRepForCachingDisplay(
@@ -378,21 +279,32 @@ public enum OverlayPreviewRenderer {
 
 @MainActor
 public final class OverlayCoordinator {
+  public var onSettings: (() -> Void)?
   public var onSubmit: ((String, InvocationSnapshot) -> Void)?
   public var onDismiss: (() -> Void)?
   public var onResultAction: ((TaskPresentationAction) -> Void)?
 
   private let lensPanel: NonactivatingPanel
   private let composerPanel: NonactivatingPanel
-  private let composerController = ComposerViewController()
+  private let composerController: ComposerViewController
   private let transformer = CoordinateTransformer()
+  private var resizeScheduled = false
   private let placement = PanelPlacement()
   private var snapshot: InvocationSnapshot?
   private var boundTaskID: UUID?
   private var lastPresentationSequence: UInt64?
-  private let compactSize = NSSize(width: 390, height: 86)
+  private let compactSize = NSSize(
+    width: OverlayMetrics.panelWidth,
+    height: OverlayMetrics.chromeHeight(includesAction: false) + OverlayMetrics.controlHeight
+      + OverlayMetrics.inputPadding
+  )
 
-  public init() {
+  public convenience init() {
+    self.init(composerController: ComposerViewController())
+  }
+
+  init(composerController: ComposerViewController) {
+    self.composerController = composerController
     lensPanel = NonactivatingPanel(
       contentRect: .zero,
       styleMask: [.borderless, .nonactivatingPanel],
@@ -403,12 +315,12 @@ public final class OverlayCoordinator {
     lensPanel.isOpaque = false
     lensPanel.hasShadow = false
     lensPanel.ignoresMouseEvents = true
-    lensPanel.level = .floating
+    lensPanel.level = .statusBar
     lensPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
     lensPanel.contentView = SemanticLensView()
 
     composerPanel = NonactivatingPanel(
-      contentRect: NSRect(x: 0, y: 0, width: 390, height: 84),
+      contentRect: NSRect(origin: .zero, size: compactSize),
       styleMask: [.borderless, .nonactivatingPanel],
       backing: .buffered,
       defer: true
@@ -416,12 +328,15 @@ public final class OverlayCoordinator {
     composerPanel.backgroundColor = .clear
     composerPanel.isOpaque = false
     composerPanel.hasShadow = true
-    composerPanel.level = .floating
+    composerPanel.level = NSWindow.Level(rawValue: NSWindow.Level.statusBar.rawValue + 1)
     composerPanel.becomesKeyOnlyIfNeeded = true
     composerPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
     composerPanel.contentViewController = composerController
+    composerPanel.setContentSize(compactSize)
+    composerPanel.onSettings = { [weak self] in self?.onSettings?() }
     composerPanel.title = "上下文操作"
     composerPanel.setAccessibilityLabel("上下文操作")
+    composerPanel.onCancel = { [weak self] in self?.dismiss() }
 
     composerController.onCancel = { [weak self] in self?.dismiss() }
     composerController.onResultAction = { [weak self] action in
@@ -429,8 +344,17 @@ public final class OverlayCoordinator {
     }
     composerController.onSubmit = { [weak self] intent in
       guard let self, let snapshot = self.snapshot else { return }
-      self.composerController.beginRunning()
       self.onSubmit?(intent, snapshot)
+    }
+    composerController.onContentSizeChange = { [weak self] in
+      guard let self, self.composerPanel.isVisible, !self.resizeScheduled else { return }
+      self.resizeScheduled = true
+      DispatchQueue.main.async { [weak self] in
+        guard let self else { return }
+        self.resizeScheduled = false
+        guard self.composerPanel.isVisible else { return }
+        self.resizeToFitConversation()
+      }
     }
   }
 
@@ -441,7 +365,8 @@ public final class OverlayCoordinator {
     self.snapshot = snapshot
     boundTaskID = nil
     lastPresentationSequence = nil
-    composerPanel.setContentSize(compactSize)
+    composerController.configure(context: accessibilityContext(for: snapshot))
+
     let displayID = snapshot.environment.displayID
     let screens = ScreenGeometry.current
     guard let screen = screens.first(where: { $0.displayID == displayID }) else {
@@ -461,21 +386,33 @@ public final class OverlayCoordinator {
     let lensFrame = targetRect.insetBy(dx: -4, dy: -4)
     lensPanel.setFrame(lensFrame, display: false)
 
+    let initialSize = NSSize(
+      width: OverlayMetrics.panelWidth,
+      height: composerController.preferredPanelHeight(
+        limit: max(
+          compactSize.height,
+          min(OverlayMetrics.maximumPanelHeight, screen.visibleFrame.height * 0.62)
+        )
+      )
+    )
+    composerPanel.setContentSize(initialSize)
     let composerFrame = placement.place(
-      panelSize: composerPanel.frame.size,
+      panelSize: initialSize,
       pointer: pointer,
       targetRect: lensFrame,
       visibleFrame: screen.visibleFrame
     )
     composerPanel.setFrame(composerFrame, display: false)
-    composerController.configure(context: contextLabel(for: snapshot))
 
     lensPanel.alphaValue = 0
     composerPanel.alphaValue = 0
     lensPanel.orderFrontRegardless()
     composerPanel.makeKeyAndOrderFront(nil)
+    composerPanel.displayIfNeeded()
+    composerPanel.invalidateShadow()
     NSAnimationContext.runAnimationGroup { context in
-      context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.12
+      context.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.16
+      context.timingFunction = CAMediaTimingFunction(name: .easeOut)
       lensPanel.animator().alphaValue = 1
       composerPanel.animator().alphaValue = 1
     }
@@ -502,22 +439,40 @@ public final class OverlayCoordinator {
     guard hasSession else { return }
     lensPanel.orderFrontRegardless()
     composerPanel.makeKeyAndOrderFront(nil)
+    resizeToFitConversation()
     composerController.focusInput()
   }
 
   public func setStatus(_ text: String, allowsRetry: Bool = false) {
-    guard isVisible else { return }
+    guard hasSession else { return }
     composerController.setStatus(text, allowsRetry: allowsRetry)
+  }
+
+  public func invalidateConversation(status: String) {
+    guard isVisible else {
+      dismiss(notify: false)
+      return
+    }
+    boundTaskID = nil
+    lastPresentationSequence = nil
+    snapshot = nil
+    composerController.invalidateConversation(status: status)
   }
 
   public func bind(taskID: UUID) {
     guard isVisible else { return }
     boundTaskID = taskID
     lastPresentationSequence = nil
+    composerController.bind(taskID: taskID)
+  }
+
+  public func presentActivity(_ presentation: AgentActivityPresentation) {
+    guard hasSession else { return }
+    composerController.presentActivity(presentation)
   }
 
   public func setContextDisclosure(_ disclosure: String) {
-    guard isVisible else { return }
+    guard hasSession else { return }
     composerController.setContextDisclosure(disclosure)
   }
 
@@ -526,7 +481,14 @@ public final class OverlayCoordinator {
     if let lastPresentationSequence, presentation.sequence <= lastPresentationSequence { return }
     lastPresentationSequence = presentation.sequence
     if let result = presentation.result {
-      showResult(result, status: presentation.status, action: presentation.action)
+      showResult(
+        result,
+        status: presentation.status,
+        action: presentation.action,
+        outcome: presentation.outcome
+      )
+    } else if let action = presentation.action {
+      showActionPrompt(status: presentation.status, action: action)
     } else {
       composerController.setStatus(
         presentation.status,
@@ -538,45 +500,47 @@ public final class OverlayCoordinator {
   public func showResult(
     _ text: String,
     status: String = "已完成",
-    action: TaskPresentationAction? = nil
+    action: TaskPresentationAction? = nil,
+    outcome: TaskPresentationOutcome = .success
   ) {
-    guard isVisible else { return }
-    let previousFrame = composerPanel.frame
-    let height = action == nil ? 154.0 : 194.0
-    let screens = ScreenGeometry.current
-    let visibleFrame =
-      screens.first(where: { $0.appKitFrame.intersects(previousFrame) })?.visibleFrame
-      ?? NSScreen.main?.visibleFrame
-      ?? previousFrame
-    let expandedFrame = NSRect(
-      x: previousFrame.minX,
-      y: previousFrame.maxY - height,
-      width: previousFrame.width,
-      height: height
-    )
-    let clampedFrame = placement.clamp(expandedFrame, toVisibleFrame: visibleFrame)
-    composerPanel.setFrame(
-      clampedFrame,
-      display: true,
-      animate: !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
-    )
+    guard hasSession else { return }
+    composerController.showResult(text, status: status, action: action, tone: outcome)
     composerController.setResultActionEnabled(true)
-    composerController.showResult(text, status: status, action: action)
   }
 
   public func showActionPrompt(status: String, action: TaskPresentationAction) {
-    guard isVisible else { return }
+    guard hasSession else { return }
+    composerController.showActionPrompt(status: status, action: action)
+    composerController.setResultActionEnabled(true)
+  }
+
+  public func resumeAfterAuthentication() {
+    guard hasSession else { return }
+    boundTaskID = nil
+    lastPresentationSequence = nil
+    if composerController.resumeAfterAuthentication() { restore() }
+  }
+
+  /// Grows with the transcript until 62% of the active screen, then keeps the
+  /// conversation scrollable. Its top edge stays fixed so the panel never
+  /// jumps away from the user as a turn unfolds.
+  private func resizeToFitConversation() {
     let previousFrame = composerPanel.frame
-    let height = 126.0
     let screens = ScreenGeometry.current
     let visibleFrame =
       screens.first(where: { $0.appKitFrame.intersects(previousFrame) })?.visibleFrame
       ?? NSScreen.main?.visibleFrame
       ?? previousFrame
+    let height = composerController.preferredPanelHeight(
+      limit: max(
+        compactSize.height,
+        min(OverlayMetrics.maximumPanelHeight, visibleFrame.height * 0.62)
+      )
+    )
     let expandedFrame = NSRect(
       x: previousFrame.minX,
       y: previousFrame.maxY - height,
-      width: previousFrame.width,
+      width: OverlayMetrics.panelWidth,
       height: height
     )
     composerPanel.setFrame(
@@ -584,16 +548,15 @@ public final class OverlayCoordinator {
       display: true,
       animate: !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     )
-    composerController.setResultActionEnabled(true)
-    composerController.showActionPrompt(status: status, action: action)
+    composerPanel.invalidateShadow()
   }
 
-  private func contextLabel(for snapshot: InvocationSnapshot) -> String {
-    let application =
-      NSRunningApplication(
-        processIdentifier: snapshot.window.processIdentifier
-      )?.localizedName ?? snapshot.window.bundleIdentifier
-    let scope = snapshot.pointedElement == nil ? "当前窗口" : "指向内容"
-    return "\(application) · \(scope)"
+  /// Names only the target application in the header and assistive technology. Actual
+  /// evidence scope remains unknown until the Agent requests it and the Host
+  /// records a manifest.
+  private func accessibilityContext(for snapshot: InvocationSnapshot) -> String {
+    NSRunningApplication(
+      processIdentifier: snapshot.window.processIdentifier
+    )?.localizedName ?? snapshot.window.bundleIdentifier
   }
 }

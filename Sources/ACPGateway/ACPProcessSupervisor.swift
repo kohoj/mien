@@ -67,6 +67,7 @@ public struct ACPProcessConfiguration: Equatable, Sendable {
     let allowed = Set([
       "PATH", "TMPDIR", "LANG", "LC_ALL", "CODEX_HOME", "NO_BROWSER",
       "CODEX_CONFIG", "CODEX_PATH", "MODEL_PROVIDER", "INITIAL_AGENT_MODE",
+      "PI_AGENT_DIR",
     ])
     return environment.filter { allowed.contains($0.key) }
   }

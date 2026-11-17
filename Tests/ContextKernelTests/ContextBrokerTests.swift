@@ -111,6 +111,65 @@ final class ContextBrokerTests: XCTestCase {
     XCTAssertEqual(providerCalls, [.screenCapture])
   }
 
+  func testAgentRequestedMultimodalBundleDoesNotStopAfterFirstSatisfiedScope() async throws {
+    let now = Date()
+    let taskID = UUID()
+    let target = makeTarget(now: now)
+    let coherenceGroup = UUID()
+    let calls = CallRecorder()
+    let accessibility = StubProvider(
+      kind: .accessibility,
+      maximumScope: .semanticRegion,
+      artifacts: [
+        makeArtifact(
+          now: now,
+          taskID: taskID,
+          targetLeaseID: target.id,
+          provider: .accessibility,
+          scope: .semanticRegion,
+          coherenceGroup: coherenceGroup
+        )
+      ],
+      calls: calls
+    )
+    let screen = StubProvider(
+      kind: .screenCapture,
+      maximumScope: .window,
+      artifacts: [
+        makeArtifact(
+          now: now,
+          taskID: taskID,
+          targetLeaseID: target.id,
+          provider: .screenCapture,
+          scope: .window,
+          coherenceGroup: coherenceGroup
+        )
+      ],
+      calls: calls
+    )
+
+    let result = try await ContextBroker(providers: [accessibility, screen]).resolve(
+      ContextCaptureRequest(
+        taskID: taskID,
+        target: target,
+        requestedScope: .window,
+        budget: ContextBudget(
+          maximumArtifacts: 4,
+          maximumBytes: 1_000_000,
+          maximumTextCharacters: 20_000,
+          deadline: now.addingTimeInterval(30)
+        ),
+        coherenceGroup: coherenceGroup,
+        requiredProviders: [.accessibility, .screenCapture]
+      ),
+      now: now
+    )
+
+    let providerCalls = await calls.values()
+    XCTAssertEqual(Set(result.artifacts.map(\.provider)), [.accessibility, .screenCapture])
+    XCTAssertEqual(providerCalls, [.accessibility, .screenCapture])
+  }
+
   func testBrokerRejectsArtifactsThatExceedTheByteBudget() async throws {
     let now = Date()
     let taskID = UUID()
@@ -172,6 +231,97 @@ final class ContextBrokerTests: XCTestCase {
     XCTAssertLessThan(start.duration(to: clock.now), .milliseconds(500))
     XCTAssertTrue(result.artifacts.isEmpty)
     XCTAssertNotNil(result.omissions[.screenCapture])
+  }
+
+  /// A `.conversation` request is the default because it covers both target
+  /// shapes: when the accessibility provider finds no conversation root it
+  /// narrows to `.semanticRegion`, and that narrower result must still be
+  /// admitted rather than silently discarded.
+  func testConversationRequestAdmitsANarrowerSemanticRegionResult() async throws {
+    let now = Date()
+    let taskID = UUID()
+    let target = makeTarget(now: now)
+    let coherenceGroup = UUID()
+    let accessibility = StubProvider(
+      kind: .accessibility,
+      maximumScope: .conversation,
+      artifacts: [
+        makeArtifact(
+          now: now,
+          taskID: taskID,
+          targetLeaseID: target.id,
+          provider: .accessibility,
+          scope: .semanticRegion,
+          coherenceGroup: coherenceGroup
+        )
+      ],
+      calls: CallRecorder()
+    )
+
+    let result = try await ContextBroker(providers: [accessibility]).resolve(
+      ContextCaptureRequest(
+        taskID: taskID,
+        target: target,
+        requestedScope: .conversation,
+        budget: ContextBudget(
+          maximumArtifacts: 4,
+          maximumBytes: 1_000_000,
+          maximumTextCharacters: 20_000,
+          deadline: now.addingTimeInterval(30)
+        ),
+        coherenceGroup: coherenceGroup
+      ), now: now)
+
+    XCTAssertEqual(result.artifacts.count, 1)
+    XCTAssertEqual(result.resolvedScope, .semanticRegion)
+    XCTAssertNil(result.omissions[.accessibility])
+  }
+
+  /// `.window` and `.conversation` are siblings in the scope lattice, so a
+  /// `.conversation` request must reject `.window` artifacts. This is why the
+  /// host no longer requests `.window`: nothing that reads accessibility can
+  /// satisfy it, and a pixel capture aimed at it would be discarded here.
+  func testConversationRequestRejectsSiblingWindowArtifacts() async throws {
+    let now = Date()
+    let taskID = UUID()
+    let target = makeTarget(now: now)
+    let coherenceGroup = UUID()
+    let screen = StubProvider(
+      kind: .screenCapture,
+      maximumScope: .window,
+      artifacts: [
+        makeArtifact(
+          now: now,
+          taskID: taskID,
+          targetLeaseID: target.id,
+          provider: .screenCapture,
+          scope: .window,
+          coherenceGroup: coherenceGroup
+        )
+      ],
+      calls: CallRecorder()
+    )
+
+    let result = try await ContextBroker(providers: [screen]).resolve(
+      ContextCaptureRequest(
+        taskID: taskID,
+        target: target,
+        requestedScope: .conversation,
+        budget: ContextBudget(
+          maximumArtifacts: 4,
+          maximumBytes: 1_000_000,
+          maximumTextCharacters: 20_000,
+          deadline: now.addingTimeInterval(30)
+        ),
+        coherenceGroup: coherenceGroup
+      ), now: now)
+
+    XCTAssertTrue(result.artifacts.isEmpty)
+    XCTAssertNil(result.resolvedScope)
+    XCTAssertEqual(
+      result.omissions[.screenCapture],
+      "provider returned no valid artifacts (artifact scope window exceeded requested scope conversation)"
+    )
   }
 
   private func makeTarget(now: Date) -> TargetLease {

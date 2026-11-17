@@ -47,6 +47,15 @@ public enum ContextScope: String, Codable, CaseIterable, Sendable {
     }
   }
 
+  /// True when no accessibility-only provider can satisfy this scope, so pixel
+  /// capture is the only route and Screen Recording must be requested up front.
+  public var requiresPixelCapture: Bool {
+    switch self {
+    case .window, .boundedHistory, .multipleApplications: true
+    default: false
+    }
+  }
+
   public var requestsConversationSemantics: Bool {
     switch self {
     case .conversation, .boundedHistory: true

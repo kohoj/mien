@@ -73,11 +73,10 @@ public actor CodexDeviceLoginCoordinator {
     )
 
     var environment = configuration.environment
-    environment["CODEX_HOME"] = configuration.codexHomeURL.path
-    environment["NO_BROWSER"] = "1"
+    environment["PI_AGENT_DIR"] = configuration.codexHomeURL.path
     let launched = try ManagedSubprocess.launch(
       executable: configuration.executableURL,
-      arguments: ["login", "--device-auth"],
+      arguments: ["login"],
       environment: environment,
       workingDirectory: configuration.workingDirectoryURL
     )
@@ -116,13 +115,14 @@ public actor CodexDeviceLoginCoordinator {
         launched.terminate()
       }
       process = nil
+      try Task.checkCancellation()
       guard exit.exitCode == 0 else {
         throw CodexDeviceLoginError.loginFailed(exitCode: exit.exitCode)
       }
       guard await accumulator.didPublishAuthorization else {
         throw CodexDeviceLoginError.authorizationDetailsUnavailable
       }
-      guard try CodexCredentialBootstrap().validateCredentialHome(configuration.codexHomeURL) else {
+      guard try Self.validatePiCredentialHome(configuration.codexHomeURL) else {
         throw CodexDeviceLoginError.invalidCredential
       }
     } catch {
@@ -142,13 +142,33 @@ public actor CodexDeviceLoginCoordinator {
     accumulator: DeviceLoginOutputAccumulator
   ) async {
     while !Task.isCancelled {
-      do {
-        guard let data = try handle.read(upToCount: 4_096), !data.isEmpty else { return }
-        await accumulator.ingest(data)
-      } catch {
-        return
-      }
+      // Device login emits a short code and then waits for the user. Reading
+      // up to 4 KiB can wait for that buffer or EOF on a live pipe, withholding
+      // the very authorization details needed for the child to finish.
+      let data = handle.availableData
+      guard !data.isEmpty else { return }
+      await accumulator.ingest(data)
     }
+  }
+
+  private nonisolated static func validatePiCredentialHome(_ home: URL) throws -> Bool {
+    let credential = home.appendingPathComponent("auth.json")
+    let values = try credential.resourceValues(forKeys: [.isRegularFileKey])
+    guard values.isRegularFile == true else { return false }
+    let attributes = try FileManager.default.attributesOfItem(atPath: credential.path)
+    guard let permissions = attributes[.posixPermissions] as? NSNumber,
+      permissions.intValue & 0o077 == 0
+    else {
+      return false
+    }
+    let data = try Data(contentsOf: credential, options: [.mappedIfSafe])
+    guard data.count <= 256 * 1_024,
+      let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+      object["openai-codex"] != nil
+    else {
+      return false
+    }
+    return true
   }
 }
 

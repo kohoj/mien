@@ -4,19 +4,17 @@ set -euo pipefail
 project_root="${0:A:h:h}"
 output_path="$project_root/.build/distribution/Mien.app"
 signing_identity="-"
-codex_acp_path=""
-codex_path=""
+pi_agent_path=""
 longview_path=""
 architectures="arm64,x86_64"
 
 usage() {
-  print -u2 "usage: $0 [--codex-acp PATH --codex PATH --longview PATH] [--output APP] [--identity ID] [--architectures arm64|arm64,x86_64]"
+  print -u2 "usage: $0 [--pi-agent PATH --longview PATH] [--output APP] [--identity ID] [--architectures arm64|arm64,x86_64]"
 }
 
 while (( $# > 0 )); do
   case "$1" in
-    --codex-acp) codex_acp_path="$2"; shift 2 ;;
-    --codex) codex_path="$2"; shift 2 ;;
+    --pi-agent) pi_agent_path="$2"; shift 2 ;;
     --longview) longview_path="$2"; shift 2 ;;
     --output) output_path="$2"; shift 2 ;;
     --identity) signing_identity="$2"; shift 2 ;;
@@ -26,33 +24,33 @@ while (( $# > 0 )); do
   esac
 done
 
-if [[ -z "$codex_acp_path" && -z "$codex_path" && -z "$longview_path" ]]; then
+if [[ -z "$pi_agent_path" && -z "$longview_path" ]]; then
   "$project_root/scripts/prepare-runtime-helpers.sh"
   runtime_directory="$project_root/.build/runtime-helpers/universal"
-  codex_acp_path="$runtime_directory/codex-acp"
-  codex_path="$runtime_directory/codex"
+  pi_agent_path="$runtime_directory/mien-pi-agent"
   longview_path="$runtime_directory/longview"
-elif [[ -z "$codex_acp_path" || -z "$codex_path" || -z "$longview_path" ]]; then
-  print -u2 "provide all three helper paths or none"
+elif [[ -z "$pi_agent_path" || -z "$longview_path" ]]; then
+  print -u2 "provide both helper paths or none"
   exit 64
 fi
 
-for helper in "$codex_acp_path" "$codex_path" "$longview_path"; do
+for helper in "$pi_agent_path" "$longview_path"; do
   [[ -x "$helper" && "${helper:A}" == /* ]] || { print -u2 "helper must be an absolute executable: $helper"; exit 66; }
 done
 [[ "$output_path" == *.app ]] || { print -u2 "output must end in .app"; exit 64; }
 [[ "$output_path" == /* ]] || output_path="$project_root/$output_path"
 
-expected_codex_version="$(plutil -extract codex.version raw "$project_root/Config/runtime-manifest.json")"
-actual_codex_version="$($codex_path --version)"
-actual_codex_version="${actual_codex_version#codex-cli }"
-[[ "$actual_codex_version" == "$expected_codex_version" ]] || {
-  print -u2 "Codex version mismatch: expected $expected_codex_version, got $actual_codex_version"
+"$project_root/scripts/build-result-renderer.sh" --check
+
+expected_pi_version="$(plutil -extract piAgent.version raw "$project_root/Config/runtime-manifest.json")"
+actual_pi_version="$($pi_agent_path --version)"
+[[ "$actual_pi_version" == "mien-pi-agent $expected_pi_version" ]] || {
+  print -u2 "Pi Agent version mismatch: expected $expected_pi_version, got $actual_pi_version"
   exit 65
 }
 
 required_architectures=(${(s:,:)architectures})
-for helper in "$codex_acp_path" "$codex_path" "$longview_path"; do
+for helper in "$pi_agent_path" "$longview_path"; do
   helper_architectures="$(lipo -archs "$helper")"
   for architecture in "${required_architectures[@]}"; do
     [[ " $helper_architectures " == *" $architecture "* ]] || {
@@ -67,21 +65,20 @@ host_binary="$build_root/Mien"
 mkdir -p "$build_root"
 
 case "$architectures" in
-  arm64|x86_64)
-    swift build --package-path "$project_root" --scratch-path "$build_root/$architectures" -c release --arch "$architectures" --product mien
-    cp "$build_root/$architectures/$architectures-apple-macosx/release/mien" "$host_binary"
-    ;;
-  arm64,x86_64|x86_64,arm64)
-    for architecture in arm64 x86_64; do
-      swift build --package-path "$project_root" --scratch-path "$build_root/$architecture" -c release --arch "$architecture" --product mien
-    done
-    lipo -create \
-      "$build_root/arm64/arm64-apple-macosx/release/mien" \
-      "$build_root/x86_64/x86_64-apple-macosx/release/mien" \
-      -output "$host_binary"
-    ;;
+  arm64|x86_64|arm64,x86_64|x86_64,arm64) ;;
   *) print -u2 "unsupported architecture set: $architectures"; exit 64 ;;
 esac
+host_binaries=()
+for architecture in "${required_architectures[@]}"; do
+  swift build --package-path "$project_root" --scratch-path "$build_root/$architecture" -c release --arch "$architecture" --product mien
+  binary_directory="$(swift build --package-path "$project_root" --scratch-path "$build_root/$architecture" -c release --arch "$architecture" --show-bin-path)"
+  host_binaries+=("$binary_directory/mien")
+done
+if (( ${#host_binaries} == 1 )); then
+  cp "${host_binaries[1]}" "$host_binary"
+else
+  lipo -create "${host_binaries[@]}" -output "$host_binary"
+fi
 
 staging_root="$(mktemp -d "${TMPDIR:-/tmp}/mien-app.XXXXXX")"
 trap 'rm -rf "$staging_root"' EXIT
@@ -91,37 +88,43 @@ cp "$project_root/Config/Info.plist" "$app/Contents/Info.plist"
 cp "$project_root/Config/runtime-manifest.json" "$app/Contents/Resources/runtime-manifest.json"
 "$project_root/scripts/build-app-icon.sh" \
   --output "$app/Contents/Resources/Mien.icns"
-[[ -d "${codex_path:h}/licenses" ]] || {
+[[ -d "${pi_agent_path:h}/licenses" ]] || {
   print -u2 "runtime helper directory is missing third-party licenses"
   exit 65
 }
-cp -R "${codex_path:h}/licenses" "$app/Contents/Resources/ThirdPartyLicenses"
+cp -R "${pi_agent_path:h}/licenses" "$app/Contents/Resources/ThirdPartyLicenses"
+cp -R \
+  "$project_root/Sources/InteractionShell/Resources/ResultRenderer" \
+  "$app/Contents/Resources/ResultRenderer"
+"$project_root/scripts/result-renderer-manifest.mjs" \
+  --metafile "$project_root/Web/ResultRenderer/dist/renderer.meta.json" \
+  --lockfile "$project_root/Web/ResultRenderer/package-lock.json" \
+  --output "$app/Contents/Resources/result-renderer-components.json" \
+  --licenses "$app/Contents/Resources/ThirdPartyLicenses/ResultRenderer"
 cp "$project_root/THIRD_PARTY_NOTICES.md" "$app/Contents/Resources/THIRD_PARTY_NOTICES.md"
 cp "$host_binary" "$app/Contents/MacOS/Mien"
-cp "$codex_acp_path" "$app/Contents/Helpers/codex-acp"
-cp "$codex_path" "$app/Contents/Helpers/codex"
+cp "$pi_agent_path" "$app/Contents/Helpers/mien-pi-agent"
 cp "$longview_path" "$app/Contents/Helpers/longview"
 chmod 755 "$app/Contents/MacOS/Mien" "$app/Contents/Helpers/"*
 
 timestamp_args=(--timestamp)
 [[ "$signing_identity" == "-" ]] && timestamp_args=(--timestamp=none)
-for helper in codex-acp codex longview; do
+for helper in mien-pi-agent longview; do
   codesign --force --sign "$signing_identity" --options runtime "${timestamp_args[@]}" "$app/Contents/Helpers/$helper"
 done
 
-codex_acp_digest="$(shasum -a 256 "$app/Contents/Helpers/codex-acp" | awk '{print $1}')"
-codex_digest="$(shasum -a 256 "$app/Contents/Helpers/codex" | awk '{print $1}')"
+pi_agent_digest="$(shasum -a 256 "$app/Contents/Helpers/mien-pi-agent" | awk '{print $1}')"
 longview_digest="$(shasum -a 256 "$app/Contents/Helpers/longview" | awk '{print $1}')"
 {
   print '{'
-  print "  \"codexACP\": \"$codex_acp_digest\","
-  print "  \"codex\": \"$codex_digest\","
+  print "  \"piAgent\": \"$pi_agent_digest\","
   print "  \"longview\": \"$longview_digest\""
   print '}'
 } > "$app/Contents/Resources/runtime-digests.json"
 "$project_root/scripts/generate-sbom.sh" \
   --manifest "$app/Contents/Resources/runtime-manifest.json" \
   --digests "$app/Contents/Resources/runtime-digests.json" \
+  --renderer-components "$app/Contents/Resources/result-renderer-components.json" \
   --output "$app/Contents/Resources/mien.cdx.json"
 
 codesign --force --sign "$signing_identity" --options runtime "${timestamp_args[@]}" \

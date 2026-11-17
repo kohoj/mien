@@ -9,6 +9,7 @@ public enum InvocationResolutionError: Error, Equatable, Sendable {
   case noWindowAtPointer
   case missingBundleIdentifier
   case noDisplayAtPointer
+  case targetChanged
 }
 
 public struct WindowSnapshot: Equatable, Sendable {
@@ -48,6 +49,10 @@ public struct SemanticSnapshot: Equatable, Sendable {
 
 public protocol WindowSnapshotProviding: Sendable {
   func window(at point: ScreenPoint, excluding processIdentifier: Int32) throws -> WindowSnapshot
+  /// Frontmost ordinary window of `processIdentifier`, for invocations that do
+  /// not originate from a pointer position — a menu bar click, for instance,
+  /// happens above every application window and so has no window under it.
+  func frontmostWindow(of processIdentifier: Int32) throws -> WindowSnapshot
   func displayID(at point: ScreenPoint) throws -> UInt32
 }
 
@@ -65,12 +70,12 @@ public struct InvocationResolver: Sendable {
     windowProvider: any WindowSnapshotProviding = SystemWindowSnapshotProvider(),
     semanticProvider: any SemanticSnapshotProviding = SystemSemanticSnapshotProvider(),
     ownProcessIdentifier: Int32 = ProcessInfo.processInfo.processIdentifier,
-    leaseDuration: TimeInterval = 30
+    leaseDuration: TimeInterval = 45
   ) {
     self.windowProvider = windowProvider
     self.semanticProvider = semanticProvider
     self.ownProcessIdentifier = ownProcessIdentifier
-    self.leaseDuration = min(max(leaseDuration, 1), 30)
+    self.leaseDuration = min(max(leaseDuration, 1), 45)
   }
 
   public func resolveCurrent(userInputEpoch: UInt64, now: Date = Date()) throws
@@ -89,6 +94,110 @@ public struct InvocationResolver: Sendable {
     )
   }
 
+  /// Renews authority for a follow-up against the exact window identity that
+  /// opened the conversation. This is a mechanical identity check, not semantic
+  /// target inference: a missing or replaced window fails closed.
+  public func renew(
+    _ snapshot: InvocationSnapshot,
+    userInputEpoch: UInt64? = nil,
+    now: Date = Date()
+  ) throws
+    -> InvocationSnapshot
+  {
+    let current = try windowProvider.frontmostWindow(of: snapshot.window.processIdentifier)
+    guard current.processIdentifier == snapshot.window.processIdentifier,
+      current.windowID == snapshot.window.windowID,
+      current.bundleIdentifier == snapshot.window.bundleIdentifier
+    else {
+      throw InvocationResolutionError.targetChanged
+    }
+    let originalPoint = snapshot.environment.pointer
+    let point =
+      current.frame.contains(originalPoint)
+      ? originalPoint
+      : ScreenPoint(
+        x: current.frame.origin.x + current.frame.size.width / 2,
+        y: current.frame.origin.y + current.frame.size.height / 2
+      )
+    let semantics = semanticProvider.snapshot(
+      at: point,
+      processIdentifier: current.processIdentifier
+    )
+    let renewedInputEpoch = userInputEpoch ?? snapshot.environment.userInputEpoch
+    let lease = WindowLease(
+      processIdentifier: current.processIdentifier,
+      windowID: current.windowID,
+      bundleIdentifier: current.bundleIdentifier,
+      frame: current.frame,
+      capturedAt: now,
+      expiresAt: now.addingTimeInterval(leaseDuration),
+      userInputEpoch: renewedInputEpoch
+    )
+    let environment = EnvironmentSnapshot(
+      frontmostProcessIdentifier: current.processIdentifier,
+      pointer: point,
+      displayID: try windowProvider.displayID(at: point),
+      userInputEpoch: renewedInputEpoch
+    )
+    return InvocationSnapshot(
+      invokedAt: now,
+      window: lease,
+      pointedElement: semantics.pointedElement,
+      focusedElement: semantics.focusedElement,
+      selectedText: semantics.selectedText,
+      environment: environment
+    )
+  }
+
+  /// Resolves against the frontmost application rather than the pointer, for
+  /// invocations that do not carry a meaningful cursor position — clicking the
+  /// menu bar item leaves the cursor above every window, where no target
+  /// exists. The semantic target then comes from keyboard focus.
+  public func resolveFrontmost(
+    frontmostProcessIdentifier: Int32? = nil,
+    userInputEpoch: UInt64,
+    now: Date = Date()
+  ) throws -> InvocationSnapshot {
+    let targetPID =
+      frontmostProcessIdentifier
+      ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+    guard let targetPID, targetPID > 0, targetPID != ownProcessIdentifier else {
+      throw InvocationResolutionError.noWindowAtPointer
+    }
+    let window = try windowProvider.frontmostWindow(of: targetPID)
+    let center = ScreenPoint(
+      x: window.frame.origin.x + window.frame.size.width / 2,
+      y: window.frame.origin.y + window.frame.size.height / 2
+    )
+    let semantics = semanticProvider.snapshot(
+      at: center,
+      processIdentifier: window.processIdentifier
+    )
+    let lease = WindowLease(
+      processIdentifier: window.processIdentifier,
+      windowID: window.windowID,
+      bundleIdentifier: window.bundleIdentifier,
+      frame: window.frame,
+      capturedAt: now,
+      expiresAt: now.addingTimeInterval(leaseDuration),
+      userInputEpoch: userInputEpoch
+    )
+    let environment = EnvironmentSnapshot(
+      frontmostProcessIdentifier: targetPID,
+      pointer: center,
+      displayID: (try? windowProvider.displayID(at: center)) ?? 0,
+      userInputEpoch: userInputEpoch
+    )
+    return InvocationSnapshot(
+      invokedAt: now,
+      window: lease,
+      pointedElement: nil,
+      focusedElement: semantics.focusedElement,
+      selectedText: semantics.selectedText,
+      environment: environment
+    )
+  }
+
   public func resolve(
     pointer: ScreenPoint,
     frontmostProcessIdentifier: Int32,
@@ -97,11 +206,33 @@ public struct InvocationResolver: Sendable {
   ) throws -> InvocationSnapshot {
     guard pointer.isFinite else { throw InvocationResolutionError.invalidPointer }
 
-    // Window identity is frozen before any overlay can become key.
-    let window = try windowProvider.window(at: pointer, excluding: ownProcessIdentifier)
+    // The target is the application the user is working in, not whatever the
+    // cursor happens to rest above. Those differ constantly: the overlay opens
+    // near the pointer, so the pointer often ends up over a window behind or
+    // beside the one being read. Prefer the frontmost application's window and
+    // fall back to the pointer only when it has none on screen.
+    let window: WindowSnapshot
+    if frontmostProcessIdentifier > 0,
+      frontmostProcessIdentifier != ownProcessIdentifier,
+      let frontWindow = try? windowProvider.frontmostWindow(of: frontmostProcessIdentifier)
+    {
+      window = frontWindow
+    } else {
+      window = try windowProvider.window(at: pointer, excluding: ownProcessIdentifier)
+    }
     let displayID = try windowProvider.displayID(at: pointer)
+    // Element lookup stays pointer-based, but only inside the chosen window: a
+    // pointer outside it would resolve to nothing and leave `pointedElement`
+    // nil, which the coordinator already handles by falling back to focus.
+    let semanticPoint =
+      window.frame.contains(pointer)
+      ? pointer
+      : ScreenPoint(
+        x: window.frame.origin.x + window.frame.size.width / 2,
+        y: window.frame.origin.y + window.frame.size.height / 2
+      )
     let semantics = semanticProvider.snapshot(
-      at: pointer,
+      at: semanticPoint,
       processIdentifier: window.processIdentifier
     )
     let lease = WindowLease(
@@ -138,6 +269,24 @@ public struct SystemWindowSnapshotProvider: WindowSnapshotProviding {
     excluding processIdentifier: Int32
   ) throws -> WindowSnapshot {
     guard point.isFinite else { throw InvocationResolutionError.invalidPointer }
+    let match = try Self.firstOrdinaryWindow { candidate in
+      candidate.processIdentifier != processIdentifier && candidate.frame.contains(point)
+    }
+    return match
+  }
+
+  public func frontmostWindow(of processIdentifier: Int32) throws -> WindowSnapshot {
+    guard processIdentifier > 0 else { throw InvocationResolutionError.noWindowAtPointer }
+    // CGWindowListCopyWindowInfo returns front-to-back, so the first match is
+    // the window the user was last looking at.
+    return try Self.firstOrdinaryWindow { $0.processIdentifier == processIdentifier }
+  }
+
+  /// Walks on-screen windows in front-to-back order and returns the first
+  /// ordinary (layer 0) window of a bundled application satisfying `predicate`.
+  private static func firstOrdinaryWindow(
+    where predicate: (WindowSnapshot) -> Bool
+  ) throws -> WindowSnapshot {
     guard
       let raw = CGWindowListCopyWindowInfo(
         [.optionOnScreenOnly, .excludeDesktopElements],
@@ -151,11 +300,9 @@ public struct SystemWindowSnapshotProvider: WindowSnapshotProviding {
       guard (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
         let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
         ownerPID > 0,
-        ownerPID != processIdentifier,
         let windowID = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
         windowID != 0,
-        let frame = Self.frame(from: info[kCGWindowBounds as String]),
-        frame.contains(point)
+        let frame = Self.frame(from: info[kCGWindowBounds as String])
       else {
         continue
       }
@@ -166,12 +313,13 @@ public struct SystemWindowSnapshotProvider: WindowSnapshotProviding {
       else {
         continue
       }
-      return WindowSnapshot(
+      let candidate = WindowSnapshot(
         processIdentifier: ownerPID,
         windowID: windowID,
         bundleIdentifier: bundleIdentifier,
         frame: frame
       )
+      if predicate(candidate) { return candidate }
     }
     throw InvocationResolutionError.noWindowAtPointer
   }

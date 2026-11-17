@@ -4,6 +4,9 @@ set -euo pipefail
 repository_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repository_root"
 
+scripts/build-result-renderer.sh --check
+bun test Runtime/PiAgent/*.test.ts
+
 swift test
 swift build -c release --product mien
 
@@ -30,6 +33,7 @@ swift format lint --strict --recursive \
   Tests/ArtifactStoreTests \
   Tests/ContextKernelTests \
   Tests/MienContractsTests \
+  Tests/MienLifecycleTests \
   Tests/DesktopActionAdaptersTests \
   Tests/HostRuntimeTests \
   Tests/InteractionShellTests \
@@ -43,10 +47,9 @@ jq -e '
   .schemaVersion == 1 and
   .acpProtocolVersion == 1 and
   .buildToolchain.bun == "1.3.13" and
-  .codex.version == "0.145.0" and
-  .codexACP.version == "1.1.7" and
-  (.codex.commit | test("^[0-9a-f]{40}$")) and
-  (.codexACP.commit | test("^[0-9a-f]{40}$")) and
+  .piAgent.version == "0.82.1" and
+  (.piAgent.commit | test("^[0-9a-f]{40}$")) and
+  (.piAgent.packageIntegrity | test("^sha512-[A-Za-z0-9+/]+={0,2}$")) and
   (.longview.commit | test("^[0-9a-f]{40}$"))
 ' Config/runtime-manifest.json >/dev/null
 
@@ -69,9 +72,9 @@ done
 preview_root="$(mktemp -d "${TMPDIR:-/tmp}/mien-preview.XXXXXX")"
 trap 'rm -rf "$preview_root"' EXIT
 swift build -c release --product mien-preview
-preview_binary="$repository_root/.build/release/mien-preview"
+preview_binary="$(swift build -c release --show-bin-path)/mien-preview"
 "$preview_binary" --all "$preview_root"
-for state in composing draft undo login; do
+for state in composing conversation draft undo login failure onboarding settings setup-connect setup-permission setup-authorization setup-model-error permission-guide; do
   test -s "$preview_root/$state.png"
 done
 

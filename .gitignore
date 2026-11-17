@@ -1,4 +1,6 @@
 .build/
+node_modules/
+Web/ResultRenderer/dist/
 .DS_Store
 *.xcuserstate
 

@@ -9,35 +9,43 @@ release_required="${2:-}"
 }
 [[ -z "$release_required" || "$release_required" == "--require-developer-id" ]] || exit 64
 
-for path in \
+for member in \
   "$app_path/Contents/MacOS/Mien" \
-  "$app_path/Contents/Helpers/codex-acp" \
-  "$app_path/Contents/Helpers/codex" \
+  "$app_path/Contents/Helpers/mien-pi-agent" \
   "$app_path/Contents/Helpers/longview" \
   "$app_path/Contents/Resources/Mien.icns" \
   "$app_path/Contents/Resources/THIRD_PARTY_NOTICES.md" \
-  "$app_path/Contents/Resources/ThirdPartyLicenses/OpenAI-Codex-Apache-2.0.txt" \
-  "$app_path/Contents/Resources/ThirdPartyLicenses/OpenAI-Codex-NOTICE.txt" \
-  "$app_path/Contents/Resources/ThirdPartyLicenses/Codex-ACP-Apache-2.0.txt" \
+  "$app_path/Contents/Resources/ThirdPartyLicenses/Pi-MIT.txt" \
   "$app_path/Contents/Resources/ThirdPartyLicenses/Longview-MIT.txt" \
+  "$app_path/Contents/Resources/ResultRenderer/index.html" \
+  "$app_path/Contents/Resources/ResultRenderer/renderer.js" \
+  "$app_path/Contents/Resources/ResultRenderer/styles.css" \
+  "$app_path/Contents/Resources/result-renderer-components.json" \
   "$app_path/Contents/Resources/mien.cdx.json" \
   "$app_path/Contents/Resources/runtime-digests.json"; do
-  [[ -e "$path" ]] || { print -u2 "missing bundle member: $path"; exit 66; }
+  [[ -e "$member" ]] || { print -u2 "missing bundle member: $member"; exit 66; }
 done
 
 /usr/bin/jq -e '
   .bomFormat == "CycloneDX" and
   .specVersion == "1.5" and
-  (.components | length == 3)
+  (.components | length > 100) and
+  any(.components[]; .name == "streamdown" and .version == "2.5.0") and
+  any(.components[]; .name == "@streamdown/cjk" and .version == "1.0.3")
 ' "$app_path/Contents/Resources/mien.cdx.json" >/dev/null
 
+/usr/bin/grep -F "default-src 'none'" \
+  "$app_path/Contents/Resources/ResultRenderer/index.html" >/dev/null
+/usr/bin/grep -F "connect-src 'none'" \
+  "$app_path/Contents/Resources/ResultRenderer/index.html" >/dev/null
+test "$(/usr/bin/find "$app_path/Contents/Resources/ThirdPartyLicenses/ResultRenderer" -type f | /usr/bin/wc -l | /usr/bin/tr -d ' ')" -gt 90
+
 /usr/bin/plutil -lint "$app_path/Contents/Info.plist" >/dev/null
-for key in codexACP codex longview; do
+for key in piAgent longview; do
   digest="$(/usr/bin/plutil -extract "$key" raw "$app_path/Contents/Resources/runtime-digests.json")"
   [[ "$digest" =~ '^[0-9a-f]{64}$' ]] || { print -u2 "invalid runtime digest: $key"; exit 65; }
   case "$key" in
-    codexACP) helper="codex-acp" ;;
-    codex) helper="codex" ;;
+    piAgent) helper="mien-pi-agent" ;;
     longview) helper="longview" ;;
   esac
   actual="$(/usr/bin/shasum -a 256 "$app_path/Contents/Helpers/$helper" | /usr/bin/awk '{print $1}')"
@@ -45,7 +53,7 @@ for key in codexACP codex longview; do
 done
 
 host_architectures=(${(z)$(/usr/bin/lipo -archs "$app_path/Contents/MacOS/Mien")})
-for helper in codex-acp codex longview; do
+for helper in mien-pi-agent longview; do
   helper_architectures="$(/usr/bin/lipo -archs "$app_path/Contents/Helpers/$helper")"
   for architecture in "${host_architectures[@]}"; do
     [[ " $helper_architectures " == *" $architecture "* ]] || {

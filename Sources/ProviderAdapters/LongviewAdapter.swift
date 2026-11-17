@@ -8,10 +8,25 @@ public enum LongviewFocusPolicy: String, Codable, Sendable {
   case foreground
 }
 
+public enum LongviewScrollDirection: String, Codable, Sendable {
+  case up
+  case down
+}
+
 public enum LongviewStopReason: String, Codable, Equatable, Sendable {
   case frameLimitReached = "frame-limit-reached"
   case endReached = "end-reached"
+  case continuityLost = "continuity-lost"
   case singleFrame = "single-frame"
+
+  var representsCompleteRange: Bool {
+    switch self {
+    case .endReached, .singleFrame:
+      true
+    case .frameLimitReached, .continuityLost:
+      false
+    }
+  }
 }
 
 public struct LongviewCaptureRequest: Sendable {
@@ -20,6 +35,7 @@ public struct LongviewCaptureRequest: Sendable {
   public let outputURL: URL
   public let maximumFrames: Int
   public let focusPolicy: LongviewFocusPolicy
+  public let direction: LongviewScrollDirection
   public let normalizedRegion: String?
 
   public init(
@@ -27,6 +43,7 @@ public struct LongviewCaptureRequest: Sendable {
     target: TargetLease,
     outputURL: URL,
     maximumFrames: Int,
+    direction: LongviewScrollDirection = .down,
     focusPolicy: LongviewFocusPolicy,
     normalizedRegion: String? = nil
   ) {
@@ -35,6 +52,7 @@ public struct LongviewCaptureRequest: Sendable {
     self.outputURL = outputURL
     self.maximumFrames = maximumFrames
     self.focusPolicy = focusPolicy
+    self.direction = direction
     self.normalizedRegion = normalizedRegion
   }
 }
@@ -117,6 +135,7 @@ public struct LongviewAdapter: Sendable {
       "--window-id", String(request.target.window.windowID),
       "--bundle-id", request.target.window.bundleIdentifier,
       "--max-frames", String(request.maximumFrames),
+      "--direction", request.direction.rawValue,
       "--focus-policy", request.focusPolicy.rawValue,
     ]
     if let region = request.normalizedRegion {
@@ -210,7 +229,7 @@ public struct LongviewAdapter: Sendable {
       sourceTrust: .hostObserved,
       sensitivity: .userContent,
       confidence: 1,
-      complete: envelope.result.stopReason != .frameLimitReached,
+      complete: envelope.result.stopReason.representsCompleteRange,
       retention: ArtifactRetention(
         expiresAt: now.addingTimeInterval(artifactTTL),
         deleteAfterTask: true,

@@ -1,0 +1,24 @@
+{
+  "name": "mien-result-renderer",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "bun test src/ResultDocument.test.tsx",
+    "build": "npm run build:javascript && npm run build:styles",
+    "build:javascript": "bun build src/main.tsx --target browser --format esm --minify --define process.env.NODE_ENV='\"production\"' --metafile=dist/renderer.meta.json --outfile dist/renderer.js",
+    "build:styles": "tailwindcss -i src/styles.css -o dist/styles.css --minify"
+  },
+  "dependencies": {
+    "@streamdown/cjk": "1.0.3",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "streamdown": "2.5.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.3",
+    "@types/react": "19.2.14",
+    "@types/react-dom": "19.2.3",
+    "tailwindcss": "4.3.3"
+  }
+}

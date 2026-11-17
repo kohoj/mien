@@ -106,9 +106,32 @@ public struct ACPAgentTurnResult: Equatable, Sendable {
   }
 }
 
+private actor ACPInboundRequestRouter {
+  private var handlers: [String: ACPInboundRequestHandler] = [:]
+
+  func install(sessionID: String, handler: @escaping ACPInboundRequestHandler) {
+    handlers[sessionID] = handler
+  }
+
+  func remove(sessionID: String) {
+    handlers.removeValue(forKey: sessionID)
+  }
+
+  func handle(_ message: JSONRPCIncomingMessage) async throws -> JSONValue {
+    guard case .object(let parameters)? = message.params,
+      case .string(let sessionID)? = parameters["sessionId"],
+      let handler = handlers[sessionID]
+    else {
+      throw ACPConnectionError.invalidResult
+    }
+    return try await handler(message)
+  }
+}
+
 public actor ACPClientRuntime {
   private let supervisor: ACPProcessSupervisor
   private let connection: ACPConnection
+  private let inboundRequestRouter: ACPInboundRequestRouter
   private let clientInfo: ACPImplementation
   private let negotiationPolicy = ACPNegotiationPolicy()
   private var initializeResult: ACPInitializeResult?
@@ -118,8 +141,13 @@ public actor ACPClientRuntime {
     clientInfo: ACPImplementation
   ) throws {
     supervisor = try ACPProcessSupervisor(configuration: configuration)
+    let router = ACPInboundRequestRouter()
+    inboundRequestRouter = router
     connection = ACPConnection(
-      transport: try ACPSubprocessTransport(configuration: configuration)
+      transport: try ACPSubprocessTransport(configuration: configuration),
+      inboundRequestHandler: { message in
+        try await router.handle(message)
+      }
     )
     self.clientInfo = clientInfo
   }
@@ -208,6 +236,48 @@ public actor ACPClientRuntime {
       timeout: .seconds(5)
     )
     await connection.discardAgentText(sessionID: sessionID)
+    await inboundRequestRouter.remove(sessionID: sessionID)
+  }
+
+  public func installInboundRequestHandler(
+    sessionID: String,
+    handler: @escaping ACPInboundRequestHandler
+  ) async {
+    await inboundRequestRouter.install(sessionID: sessionID, handler: handler)
+  }
+
+  public func removeInboundRequestHandler(sessionID: String) async {
+    await inboundRequestRouter.remove(sessionID: sessionID)
+  }
+
+  /// Applies one model value advertised by this exact session. Keeping this
+  /// narrow prevents the Host from gaining a generic session-configuration
+  /// surface while still using ACP's standard typed configuration method.
+  public func selectModel(
+    sessionID: String,
+    configurationID: String,
+    modelID: String
+  ) async throws -> ACPAgentModelConfiguration {
+    guard !sessionID.isEmpty, !configurationID.isEmpty, !modelID.isEmpty else {
+      throw ACPConnectionError.invalidResult
+    }
+    let value = try await connection.request(
+      method: "session/set_config_option",
+      parameters: ACPSetSessionConfigOptionParameters(
+        sessionId: sessionID,
+        configId: configurationID,
+        value: modelID
+      ),
+      timeout: .seconds(15)
+    )
+    let result: ACPSetSessionConfigOptionResult = try Self.decode(value)
+    let applied = try result.agentModelConfiguration()
+    guard applied.configID == configurationID,
+      applied.catalog.currentModelID == modelID
+    else {
+      throw ACPModelConfigurationError.malformed
+    }
+    return applied
   }
 
   public func promptCollectingText(
@@ -223,6 +293,10 @@ public actor ACPClientRuntime {
 
   public nonisolated var updates: AsyncStream<JSONRPCIncomingMessage> {
     connection.updates
+  }
+
+  public func activityUpdates(sessionID: String) async -> AsyncStream<ACPAgentActivityUpdate> {
+    await connection.activityUpdates(sessionID: sessionID)
   }
 
   public func stop() async {

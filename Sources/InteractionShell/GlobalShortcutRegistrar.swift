@@ -21,6 +21,17 @@ public final class GlobalShortcutRegistrar {
     }
 
     public static let `default` = Shortcut()
+
+    /// Human-readable form for menus and tooltips, e.g. "⌃⌥Space".
+    public var displayName: String {
+      var text = ""
+      if modifiers & UInt32(controlKey) != 0 { text += "⌃" }
+      if modifiers & UInt32(optionKey) != 0 { text += "⌥" }
+      if modifiers & UInt32(shiftKey) != 0 { text += "⇧" }
+      if modifiers & UInt32(cmdKey) != 0 { text += "⌘" }
+      text += keyCode == UInt32(kVK_Space) ? "Space" : "Key\(keyCode)"
+      return text
+    }
   }
 
   public var onPress: (@MainActor () -> Void)?

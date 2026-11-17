@@ -6,7 +6,7 @@
 
 <p align="center"><strong>Your intent, in context.</strong></p>
 
-Mien is a quiet native macOS intelligence layer that brings a user-owned Codex to the point of intent. Press one global shortcut while pointing at content. Mien freezes the exact app, window, semantic element, selection, and input epoch before its own UI appears; gathers only the context the request needs; and returns the result beside its source. When an editable field can be proven, the user may explicitly insert a draft, verify it by reading it back, and undo it. Mien never sends a message.
+Mien is a quiet native macOS intelligence layer that brings a user-owned Codex to the point of intent. Press one global shortcut while pointing at content. Mien freezes the exact target, gives your words verbatim to one Agent session, acquires only the typed evidence that Agent requests, and returns the result beside its source. When an editable field can be proven, the user may explicitly insert a typed draft proposal, verify it by reading it back, and undo it. Mien never sends a message.
 
 > **Developer preview.** The source and universal development bundle are usable today. The bundle is ad-hoc signed because this repository does not possess a Developer ID identity; it is not a notarized consumer release.
 
@@ -30,38 +30,44 @@ Requirements: macOS 14+, Xcode with Swift 6, Git, npm, `jq`, and Bun 1.3.13.
 git clone https://github.com/kohoj/mien.git
 cd mien
 scripts/verify-mien.sh
-scripts/assemble-app.sh
-open .build/distribution/Mien.app
+./script/build_and_run.sh --verify
 ```
 
-`assemble-app.sh` resolves only the revisions in `Config/runtime-manifest.json`, builds both Apple Silicon and Intel slices, merges universal helpers, signs the bundle inside-out, and verifies every nested executable and digest. It does not discover production helpers from `PATH`.
+`script/build_and_run.sh` is the single contributor run entrypoint and powers the Codex Run action. It delegates bundle creation to `scripts/assemble-app.sh` and exact-process installation to `scripts/install-app.sh`; the underlying assembler resolves only the revisions in `Config/runtime-manifest.json`, builds both Apple Silicon and Intel slices, merges universal helpers, signs the bundle inside-out, and verifies every nested executable and digest. It does not discover production helpers from `PATH`.
 
-On first use, press **Control–Option–Space**. Mien reuses a private existing Codex login when one is safely available; otherwise it presents the official Codex device-login URL and one-time code, then resumes the original request. Accessibility and Screen Recording are requested only when the chosen scope needs them.
+First launch presents one next step at a time: connect the ChatGPT account, authorize a reading capability, then use **Control–Option–Space** in the current window. Missing credentials use Pi's official OpenAI device-code flow inside Mien, followed by a verified Agent handshake and live model discovery. A second reading capability is optional. Permission controls open the exact System Settings pane; the attached guide helps add Mien to Apple's list, while live preflight APIs alone prove authorization.
+
+An ordinary click on Mien's menu-bar mark exposes the current action, **Settings…**, and Quit. **Command–Comma** opens a separate compact Settings window for account, live models, permissions, and shortcut guidance. A retained conversation is labelled **Continue conversation** and restores its original target. Settings never doubles as a first-run welcome page.
+
+The Agent resolves Codex authentication before its readiness handshake, model-session creation, and each user turn. An OAuth refresh failure is a typed authentication failure: Mien offers **Connect ChatGPT** instead of retrying the same expired credential. Clicking it starts the bundled device-login flow, displays the code inside Mien, and opens the official authorization page. After authorization, Mien verifies the connection and resumes the original immutable turn through normal submission: it renews the exact original target and creates a fresh task while preserving an existing idle Agent conversation. A changed target is refused. No terminal command is needed.
 
 ## Trust boundary
 
 ```text
-hotkey -> immutable target lease -> deterministic policy
-       -> selection / Accessibility / bounded Longview context
+hotkey -> immutable target lease -> verbatim input to one Agent session
+       -> typed context decision: none or one exact evidence request
+       -> deterministic Host policy -> selection / AX / frame / history if requested
        -> private immutable artifacts -> destination disclosure
-       -> supervised codex-acp + Codex -> native result
+       -> same Agent session -> typed answer or draft proposal
        -> explicit typed mutation -> read-back verification -> undo
        -> verified cleanup + durable recovery journal
 ```
 
-Mien exposes no generic shell, click, keystroke, clipboard, or unrestricted filesystem capability to the agent. Inbound ACP permission requests are denied unless a typed broker owns the exact operation. Process exit, model prose, and tool return values never become success facts.
+Mien exposes no generic shell, click, keystroke, clipboard, or unrestricted filesystem capability to the Agent. Pi's coding-session loader, built-in tools, ambient extensions, skills, context files, and MCP configuration are absent. The only model-callable tools are typed `request_context` and `submit_outcome`; a provider-enforced state machine exposes exactly one at a time and the Host validates both. Process exit, model prose, and tool return values never become success facts.
 
 ## What is implemented
 
 - Exact WindowServer + Accessibility target leases and stale-target refusal.
-- Minimum-context provider ladder with explicit local/remote destination disclosure.
-- Background-only [Longview](https://github.com/kohoj/longview) capture with restoration receipts.
-- Pinned Codex 0.145.0 and `codex-acp` 1.1.7, bounded processes, cancellation, deadlines, output caps, and integrity checks.
-- Native Codex device login with a product-owned private credential home.
+- Agent-owned typed evidence selection, including Accessibility plus visual context, with explicit local/remote destination disclosure.
+- Background-first [Longview](https://github.com/kohoj/longview) capture that fails unless any activation, viewport, focus, and pointer changes are restored and verified.
+- Pinned Pi Agent 0.82.1, bounded process transport, cancellation, deadlines, output caps, and integrity checks.
+- One provider-enforced Pi tool loop per turn: the Agent explicitly selects no context or one catalog request, then submits the typed outcome without a Host-side intent parser, fallback prompt, or second planning call.
+- Unified Agent connection, native Codex-subscription device login, and a product-owned private Pi credential directory.
+- Live `openai-codex` model selection in Settings, applied before the next task receives user input. Setup asks for a model only when a saved choice is no longer available.
 - Compare-and-swap AX draft insertion, read-back verification, automatic rollback, and a 30-second undo window.
 - A segmented, fsynced, owner-only recovery journal whose closed segments are immutable.
 - One native task surface that can detach to a single menu-bar task center and restore without losing the frozen task.
-- Reproducible universal `arm64 + x86_64` app assembly and opt-in live ACP probes.
+- Reproducible universal `arm64 + x86_64` app assembly and opt-in live Pi Agent probes.
 
 ## System modules
 
@@ -74,7 +80,7 @@ Mien exposes no generic shell, click, keystroke, clipboard, or unrestricted file
 | `ProviderAdapters` | selection, Accessibility, and Longview translations |
 | `ArtifactStore` | private 0600 atomic artifacts and deterministic cleanup |
 | `PolicyKernel` | subject, operation, sensitivity, and destination policy |
-| `ACPGateway` | stable ACP v1 framing, process isolation, restart containment |
+| `ACPGateway` | bounded NDJSON-RPC framing, child isolation, restart containment |
 | `SubprocessKernel` | bounded process groups, cancellation, output and deadline fences |
 | `TaskRuntime` | monotonic event-sourced task truth |
 | `ActionKernel` | exact grants and verified typed mutations |

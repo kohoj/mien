@@ -31,6 +31,7 @@ let package = Package(
       name: "PermissionKernel",
       linkerSettings: [
         .linkedFramework("ApplicationServices"),
+        .linkedFramework("AppKit"),
         .linkedFramework("CoreGraphics"),
       ]
     ),
@@ -77,10 +78,14 @@ let package = Package(
     ),
     .target(
       name: "InteractionShell",
-      dependencies: ["MienContracts", "InvocationKernel"],
+      dependencies: ["MienContracts", "InvocationKernel", "PermissionKernel"],
+      resources: [
+        .copy("Resources/ResultRenderer")
+      ],
       linkerSettings: [
         .linkedFramework("AppKit"),
         .linkedFramework("Carbon"),
+        .linkedFramework("WebKit"),
       ]
     ),
     .target(
@@ -150,6 +155,10 @@ let package = Package(
       dependencies: ["MienContracts"]
     ),
     .testTarget(
+      name: "SubprocessKernelTests",
+      dependencies: ["SubprocessKernel"]
+    ),
+    .testTarget(
       name: "InvocationKernelTests",
       dependencies: ["InvocationKernel", "MienContracts"]
     ),
@@ -179,8 +188,12 @@ let package = Package(
       dependencies: ["ACPGateway", "MienContracts"]
     ),
     .testTarget(
+      name: "MienLifecycleTests",
+      dependencies: ["Mien", "ACPGateway", "TaskRuntime"]
+    ),
+    .testTarget(
       name: "InteractionShellTests",
-      dependencies: ["InteractionShell", "MienContracts"]
+      dependencies: ["InteractionShell", "MienContracts", "PermissionKernel"]
     ),
     .testTarget(
       name: "ArtifactStoreTests",

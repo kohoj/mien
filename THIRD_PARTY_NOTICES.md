@@ -1,13 +1,14 @@
 # Third-party notices
 
-Mien is MIT licensed. Its assembled development and release bundles include the following unmodified, separately maintained executables:
+Mien is MIT licensed. Its assembled development and release bundles include the following pinned, separately maintained runtimes:
 
 | Component | Pinned revision | License | Source |
 |---|---|---|---|
-| OpenAI Codex | `0.145.0`, `25af12f7e61572b0bc18ddb1008be543b91519b0` | Apache-2.0 | <https://github.com/openai/codex> |
-| Codex ACP | `1.1.7`, `ba5bef59cfcea4229841fe9438d816696621307b` | Apache-2.0, Copyright 2025 JetBrains s.r.o. | <https://github.com/agentclientprotocol/codex-acp> |
-| Longview | `1400db26424323e5e413bdf2f1b03a07961f2458` | MIT, Copyright 2026 Longview contributors | <https://github.com/kohoj/longview> |
+| Pi Agent Harness | `0.82.1`, `cced6a21da273b26ee4a23a803680614bbe8dd1e` | MIT | <https://github.com/earendil-works/pi> |
+| Longview | `bff4662cf7b06469101f7a2f3900e904bfce5aa9` | MIT, Copyright 2026 Longview contributors | <https://github.com/kohoj/longview> |
+| Streamdown | `2.5.0` | Apache-2.0 | <https://github.com/vercel/streamdown> |
+| Streamdown CJK | `1.0.3` | Apache-2.0 | <https://github.com/vercel/streamdown> |
+| React | `19.2.8` | MIT | <https://github.com/facebook/react> |
+| React DOM | `19.2.8` | MIT | <https://github.com/facebook/react> |
 
-OpenAI Codex includes code derived from Ratatui under the MIT License, Copyright 2016–2022 Florian Dehau and Copyright 2023–2025 The Ratatui Developers.
-
-The exact manifest used for a build is embedded at `Contents/Resources/runtime-manifest.json`. Complete upstream license and NOTICE texts are embedded at `Contents/Resources/ThirdPartyLicenses/`. The build fails if those files are absent.
+The exact native-runtime manifest is embedded at `Contents/Resources/runtime-manifest.json`. The locally bundled result renderer is pinned by `Web/ResultRenderer/package-lock.json`; its complete transitive component manifest is embedded at `Contents/Resources/result-renderer-components.json`. Upstream license and NOTICE texts for every bundled runtime and renderer component are embedded at `Contents/Resources/ThirdPartyLicenses/`. The build fails if those files or the renderer's locked, generated artifacts are absent or stale.
